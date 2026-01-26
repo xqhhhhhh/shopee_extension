@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-Hans">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Shopdora Extractor</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <h1>Shopdora Extractor</h1>
+        <p>从Shopee商品页的Shopdora插件模块提取数据</p>
+      </header>
+
+      <section class="panel">
+        <label for="urlList">批量URL（每行一个）</label>
+        <textarea id="urlList" rows="6" placeholder="https://shopee.ph/...\nhttps://shopee.ph/..."></textarea>
+        <div class="buttons">
+          <button id="extractCurrent">提取当前页</button>
+          <button id="extractBatch">批量提取</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="buttons">
+          <button id="downloadJson" disabled>下载JSON</button>
+          <button id="downloadCsv" disabled>下载CSV</button>
+        </div>
+        <pre id="output" class="output">等待提取...</pre>
+      </section>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

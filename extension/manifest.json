@@ -1,0 +1,72 @@
+{
+  "manifest_version": 3,
+  "name": "Shopdora Extractor",
+  "version": "0.1.0",
+  "description": "Extract Shopdora module data from Shopee product pages.",
+  "permissions": ["activeTab", "tabs", "downloads"],
+  "host_permissions": [
+    "https://shopee.ph/*",
+    "https://*.shopee.ph/*",
+    "https://shopee.sg/*",
+    "https://*.shopee.sg/*",
+    "https://shopee.co.id/*",
+    "https://*.shopee.co.id/*",
+    "https://shopee.vn/*",
+    "https://*.shopee.vn/*",
+    "https://shopee.tw/*",
+    "https://*.shopee.tw/*",
+    "https://shopee.my/*",
+    "https://*.shopee.my/*",
+    "https://shopee.co.th/*",
+    "https://*.shopee.co.th/*",
+    "https://shopee.com.br/*",
+    "https://*.shopee.com.br/*",
+    "https://shopee.com.mx/*",
+    "https://*.shopee.com.mx/*",
+    "https://shopee.com.co/*",
+    "https://*.shopee.com.co/*",
+    "https://shopee.cl/*",
+    "https://*.shopee.cl/*",
+    "https://shopee.com.pe/*",
+    "https://*.shopee.com.pe/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Shopdora Extractor",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://shopee.ph/*",
+        "https://*.shopee.ph/*",
+        "https://shopee.sg/*",
+        "https://*.shopee.sg/*",
+        "https://shopee.co.id/*",
+        "https://*.shopee.co.id/*",
+        "https://shopee.vn/*",
+        "https://*.shopee.vn/*",
+        "https://shopee.tw/*",
+        "https://*.shopee.tw/*",
+        "https://shopee.my/*",
+        "https://*.shopee.my/*",
+        "https://shopee.co.th/*",
+        "https://*.shopee.co.th/*",
+        "https://shopee.com.br/*",
+        "https://*.shopee.com.br/*",
+        "https://shopee.com.mx/*",
+        "https://*.shopee.com.mx/*",
+        "https://shopee.com.co/*",
+        "https://*.shopee.com.co/*",
+        "https://shopee.cl/*",
+        "https://*.shopee.cl/*",
+        "https://shopee.com.pe/*",
+        "https://*.shopee.com.pe/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
