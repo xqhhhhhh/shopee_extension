@@ -29,6 +29,21 @@
           <button id="pauseBatch" disabled>暂停</button>
         </div>
       </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>自动抓取设置</h2>
+        </div>
+        <label for="categoryUrl">分类页URL</label>
+        <input id="categoryUrl" type="text" placeholder="https://shopee.ph/..." />
+        <div class="config-row">
+          <label for="scheduleTime" class="inline-label">每日时间</label>
+          <input id="scheduleTime" type="time" value="02:00" />
+          <button id="saveSchedule" type="button">保存</button>
+          <button id="runDailyNow" type="button">立即运行</button>
+        </div>
+        <p id="scheduleInfo" class="hint">尚未设置自动抓取</p>
+      </section>
       
       <section class="panel">
         <div class="buttons">
@@ -36,6 +51,18 @@
           <button id="downloadCsv" disabled>下载CSV</button>
         </div>
         <pre id="output" class="output">等待提取...</pre>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>筛选结果</h2>
+        </div>
+        <div class="buttons">
+          <button id="runFilter">运行筛选</button>
+          <button id="downloadFilter" disabled>下载筛选URL</button>
+          <button id="downloadHistory">下载历史JSONL</button>
+        </div>
+        <pre id="filterOutput" class="output output--compact">等待筛选...</pre>
       </section>
 
       <section class="panel">

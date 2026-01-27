@@ -128,6 +128,27 @@ input[type="number"] {
   font-family: var(--mono);
 }
 
+input[type="text"],
+input[type="time"] {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--text);
+}
+
+input[type="text"] {
+  width: 100%;
+  margin-bottom: 8px;
+}
+
+.hint {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
 .buttons {
   display: flex;
   gap: 8px;
