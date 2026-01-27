@@ -14,14 +14,22 @@
       </header>
 
       <section class="panel">
-        <label for="urlList">批量URL（每行一个）</label>
-        <textarea id="urlList" rows="6" placeholder="https://shopee.ph/...\nhttps://shopee.ph/..."></textarea>
+        <label for="urlFile">批量URL文件（每行一个）</label>
+        <div class="file-row">
+          <input id="urlFile" type="file" accept=".txt" />
+          <button id="importUrls" type="button">导入文件</button>
+        </div>
+        <div class="config-row">
+          <label for="concurrency" class="inline-label">并发Tab</label>
+          <input id="concurrency" type="number" min="1" max="10" step="1" value="3" />
+        </div>
         <div class="buttons">
           <button id="extractCurrent">提取当前页</button>
           <button id="extractBatch">批量提取</button>
+          <button id="pauseBatch" disabled>暂停</button>
         </div>
       </section>
-
+      
       <section class="panel">
         <div class="buttons">
           <button id="downloadJson" disabled>下载JSON</button>
@@ -29,6 +37,23 @@
         </div>
         <pre id="output" class="output">等待提取...</pre>
       </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>分类页商品链接</h2>
+          <label class="option">
+            <input type="checkbox" id="autoPaginate" checked />
+            自动翻页
+          </label>
+        </div>
+        <div class="buttons">
+          <button id="extractList">抓取当前分类页链接</button>
+          <button id="downloadUrls" disabled>下载URL</button>
+        </div>
+        <pre id="listOutput" class="output output--compact">等待抓取...</pre>
+      </section>
+
+
     </div>
 
     <script src="popup.js"></script>

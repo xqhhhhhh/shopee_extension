@@ -48,6 +48,32 @@ header p {
   box-shadow: 0 10px 20px rgba(255, 106, 0, 0.08);
 }
 
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.panel-header h2 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.option input {
+  margin: 0;
+}
+
 label {
   display: block;
   margin-bottom: 6px;
@@ -66,10 +92,47 @@ textarea {
   min-height: 92px;
 }
 
+.file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+input[type="file"] {
+  flex: 1;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.config-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.inline-label {
+  display: inline-flex;
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+input[type="number"] {
+  width: 80px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 12px;
+  font-family: var(--mono);
+}
+
 .buttons {
   display: flex;
   gap: 8px;
   margin-top: 10px;
+  flex-wrap: wrap;
 }
 
 button {
@@ -109,4 +172,9 @@ button:disabled {
   font-family: var(--mono);
   font-size: 11px;
   color: var(--text);
+}
+
+.output--compact {
+  min-height: 110px;
+  max-height: 160px;
 }

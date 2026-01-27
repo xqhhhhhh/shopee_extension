@@ -3,7 +3,7 @@
   "name": "Shopdora Extractor",
   "version": "0.1.0",
   "description": "Extract Shopdora module data from Shopee product pages.",
-  "permissions": ["activeTab", "tabs", "downloads"],
+  "permissions": ["activeTab", "tabs", "downloads", "storage"],
   "host_permissions": [
     "https://shopee.ph/*",
     "https://*.shopee.ph/*",

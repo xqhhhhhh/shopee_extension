@@ -469,9 +469,9 @@
     };
   }
 
-  async function waitForShopdoraRoot() {
+  async function waitForShopdoraRoot(timeoutMs = MAX_WAIT_MS) {
     const start = Date.now();
-    while (Date.now() - start < MAX_WAIT_MS) {
+    while (Date.now() - start < timeoutMs) {
       const root = findShopdoraRoot();
       if (root) return root;
       await sleep(POLL_INTERVAL_MS);
@@ -479,22 +479,343 @@
     return null;
   }
 
+  function buildDataSignature(data) {
+    if (!data) return '';
+    const price = data.price || {};
+    const sales = data.sales || {};
+    const skuSig = (data.sku || [])
+      .map((row) => [
+        row?.name ?? '',
+        row?.price ?? '',
+        row?.stock ?? '',
+        row?.salesShare ?? '',
+        row?.salesEstimate ?? ''
+      ].join('|'))
+      .join(';;');
+
+    return [
+      data.productId ?? '',
+      data.sellerName ?? '',
+      data.category ?? '',
+      data.listedDate ?? '',
+      price.currentPHP ?? '',
+      price.currentCNY ?? '',
+      price.original ?? '',
+      price.discount ?? '',
+      sales.totalQty ?? '',
+      sales.last30Qty ?? '',
+      sales.totalRevenue ?? '',
+      sales.last30Revenue ?? '',
+      skuSig
+    ].join('::');
+  }
+
+  function isPlaceholderText(text) {
+    if (!text) return true;
+    const trimmed = text.trim();
+    if (!trimmed) return true;
+    if (/加载|loading/i.test(trimmed)) return true;
+    if (/^(\.{2,}|-+|—+)$/.test(trimmed)) return true;
+    return false;
+  }
+
+  function getSkuTableStatus(root) {
+    const tables = Array.from(root.querySelectorAll('table'));
+    for (const table of tables) {
+      const headerRow = table.querySelector('thead tr') || table.querySelector('tr');
+      if (!headerRow) continue;
+      const headerCells = Array.from(headerRow.querySelectorAll('th, td'));
+      const headerText = headerCells.map((cell) => (cell.innerText || '').trim()).join(' ');
+      if (!/sku|规格|型号|款式|名称/i.test(headerText)) continue;
+
+      const rows = Array.from(table.querySelectorAll('tbody tr'));
+      let totalRows = 0;
+      let completeRows = 0;
+      for (const row of rows) {
+        const cells = Array.from(row.querySelectorAll('td'));
+        if (!cells.length) continue;
+        totalRows += 1;
+        const isComplete = cells.every((cell) => !isPlaceholderText(cell.textContent || ''));
+        if (isComplete) completeRows += 1;
+      }
+
+      return {
+        hasTable: true,
+        totalRows,
+        completeRows,
+        isComplete: totalRows > 0 && totalRows === completeRows
+      };
+    }
+    return { hasTable: false, totalRows: 0, completeRows: 0, isComplete: false };
+  }
+
+  function hasMinimumData(data, tableStatus) {
+    if (tableStatus?.hasTable) {
+      return tableStatus.totalRows > 0;
+    }
+    return Boolean(data && data.sku && data.sku.length);
+  }
+
+  async function waitForStableData(root, { timeoutMs, pollMs, stableRounds, idleMs }) {
+    let lastSignature = '';
+    let stableCount = 0;
+    let lastData = null;
+    const start = Date.now();
+    let lastMutation = Date.now();
+    const observer = new MutationObserver(() => {
+      lastMutation = Date.now();
+    });
+    observer.observe(root, { subtree: true, childList: true, characterData: true });
+
+    try {
+      while (Date.now() - start < timeoutMs) {
+        const data = extractData(root);
+        const tableStatus = getSkuTableStatus(root);
+        const signature = `${buildDataSignature(data)}::${tableStatus.totalRows}::${tableStatus.completeRows}`;
+        if (signature && signature === lastSignature) {
+          stableCount += 1;
+        } else {
+          stableCount = 0;
+          lastSignature = signature;
+        }
+        lastData = data;
+        const idleEnough = Date.now() - lastMutation >= idleMs;
+        const dataReady = tableStatus.hasTable ? tableStatus.isComplete : hasMinimumData(data, tableStatus);
+        if (stableCount >= stableRounds && idleEnough && dataReady) {
+          return { data, stable: true };
+        }
+        await sleep(pollMs);
+      }
+    } finally {
+      observer.disconnect();
+    }
+
+    return { data: lastData, stable: false };
+  }
+
   async function runExtraction() {
-    const root = await waitForShopdoraRoot();
+    const retryLimit = 3;
+    const retryWaitMs = 5000;
+    let root = null;
+
+    for (let attempt = 1; attempt <= retryLimit; attempt += 1) {
+      root = await waitForShopdoraRoot(retryWaitMs);
+      if (root) break;
+      if (attempt < retryLimit) {
+        await sleep(300);
+      }
+    }
+
     if (!root) {
       return {
         success: false,
-        error: '未检测到Shopdora模块，可能还在加载或被隐藏。'
+        error: `未检测到Shopdora模块，已重试${retryLimit}次。`
       };
     }
 
-    const data = extractData(root);
+    let data = null;
+    let stable = false;
+    for (let attempt = 1; attempt <= retryLimit; attempt += 1) {
+      const result = await waitForStableData(root, {
+        timeoutMs: retryWaitMs,
+        pollMs: 800,
+        stableRounds: 3,
+        idleMs: 1200
+      });
+      data = result.data;
+      stable = result.stable;
+      if (stable) break;
+      if (attempt < retryLimit) {
+        await sleep(300);
+      }
+    }
+
+    if (!stable && data) {
+      data.warnings = data.warnings || [];
+      data.warnings.push(`字段仍在加载，已重试${retryLimit}次`);
+    }
+
     return { success: true, data };
   }
 
+  const LIST_ITEM_SELECTOR = 'li.col-xs-2-4.shopee-search-item-result__item';
+  const LIST_LINK_SELECTOR = '.contents';
+  const NEXT_PAGE_SELECTOR = '.shopee-icon-button.shopee-icon-button--right';
+  const MAX_LIST_PAGES = 50;
+  const SCROLL_IDLE_ROUNDS = 3;
+  const SCROLL_STEP_MS = 800;
+
+  function normalizeUrl(href) {
+    if (!href) return null;
+    try {
+      return new URL(href, location.origin).href;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function extractListUrlsFromPage() {
+    const items = Array.from(document.querySelectorAll(LIST_ITEM_SELECTOR));
+    const urls = [];
+    for (const item of items) {
+      const contentEl = item.querySelector(LIST_LINK_SELECTOR);
+      if (!contentEl) continue;
+      let link = null;
+      if (contentEl.tagName === 'A') {
+        link = contentEl.getAttribute('href') || contentEl.href;
+      } else if (typeof contentEl.getAttribute === 'function') {
+        link = contentEl.getAttribute('href');
+      }
+      if (!link) {
+        const anchor = contentEl.querySelector('a[href]');
+        link = anchor ? anchor.getAttribute('href') || anchor.href : null;
+      }
+      const normalized = normalizeUrl(link);
+      if (normalized) urls.push(normalized);
+    }
+    return urls;
+  }
+
+  async function waitForListItems(timeoutMs = MAX_WAIT_MS) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const items = document.querySelectorAll(LIST_ITEM_SELECTOR);
+      if (items.length) return Array.from(items);
+      await sleep(POLL_INTERVAL_MS);
+    }
+    return null;
+  }
+
+  async function autoScrollToLoadAllItems() {
+    let idleRounds = 0;
+    let lastCount = 0;
+    const start = Date.now();
+
+    while (Date.now() - start < MAX_WAIT_MS) {
+      const items = document.querySelectorAll(LIST_ITEM_SELECTOR);
+      const count = items.length;
+
+      if (count > lastCount) {
+        lastCount = count;
+        idleRounds = 0;
+      } else {
+        idleRounds += 1;
+      }
+
+      if (idleRounds >= SCROLL_IDLE_ROUNDS) {
+        break;
+      }
+
+      window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+      await sleep(SCROLL_STEP_MS);
+    }
+
+    window.scrollTo({ top: 0, behavior: 'instant' });
+    await sleep(200);
+  }
+
+  function isNextPageDisabled(button) {
+    if (!button) return true;
+    if (button.disabled) return true;
+    const ariaDisabled = button.getAttribute('aria-disabled');
+    if (ariaDisabled === 'true') return true;
+    if (button.classList.contains('disabled')) return true;
+    if (button.classList.contains('shopee-icon-button--disabled')) return true;
+    return false;
+  }
+
+  function getPageSignature() {
+    const urls = extractListUrlsFromPage();
+    if (!urls.length) return '';
+    return urls.slice(0, 5).join('|');
+  }
+
+  async function waitForPageChange(prevSignature) {
+    const start = Date.now();
+    while (Date.now() - start < MAX_WAIT_MS) {
+      const signature = getPageSignature();
+      if (signature && signature !== prevSignature) return signature;
+      await sleep(POLL_INTERVAL_MS);
+    }
+    return null;
+  }
+
+  async function collectListUrls({ paginate = false, maxPages = MAX_LIST_PAGES } = {}) {
+    const warnings = [];
+    const urls = new Set();
+    let pages = 0;
+    const pageLimit = Number.isFinite(maxPages) && maxPages > 0 ? maxPages : MAX_LIST_PAGES;
+
+    const initialItems = await waitForListItems();
+    if (!initialItems) {
+      return {
+        success: false,
+        error: '未找到商品列表，页面可能未加载完成。'
+      };
+    }
+
+    while (true) {
+      pages += 1;
+      await autoScrollToLoadAllItems();
+      const pageUrls = extractListUrlsFromPage();
+      if (!pageUrls.length) {
+        warnings.push(`第${pages}页未解析到商品链接`);
+      } else {
+        pageUrls.forEach((url) => urls.add(url));
+      }
+
+      if (!paginate) break;
+      if (pages >= pageLimit) {
+        warnings.push(`已达到最大翻页数限制（${pageLimit}页）`);
+        break;
+      }
+
+      const nextButton = document.querySelector(NEXT_PAGE_SELECTOR);
+      if (!nextButton) {
+        warnings.push('未找到下一页按钮');
+        break;
+      }
+      if (isNextPageDisabled(nextButton)) {
+        break;
+      }
+
+      const signature = getPageSignature();
+      nextButton.scrollIntoView({ block: 'center' });
+      nextButton.click();
+
+      const changed = await waitForPageChange(signature);
+      if (!changed) {
+        warnings.push('翻页后页面内容未更新');
+        break;
+      }
+
+      const items = await waitForListItems();
+      if (!items) {
+        warnings.push('翻页后商品列表加载失败');
+        break;
+      }
+    }
+
+    return {
+      success: true,
+      urls: Array.from(urls),
+      pages,
+      warnings
+    };
+  }
+
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (!message || message.type !== 'extract') return;
-    runExtraction().then(sendResponse);
-    return true;
+    if (!message) return;
+    if (message.type === 'extract') {
+      runExtraction().then(sendResponse);
+      return true;
+    }
+    if (message.type === 'collect-product-urls') {
+      collectListUrls({
+        paginate: Boolean(message.paginate),
+        maxPages: message.maxPages
+      }).then(sendResponse);
+      return true;
+    }
   });
 })();
