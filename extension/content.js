@@ -1,6 +1,14 @@
 (() => {
   const MAX_WAIT_MS = 30000;
   const POLL_INTERVAL_MS = 500;
+  const CLICK_DELAY_MIN_MS = 500;
+  const CLICK_DELAY_MAX_MS = 2000;
+  const PAGE_CHANGE_DELAY_MIN_MS = 1000;
+  const PAGE_CHANGE_DELAY_MAX_MS = 3000;
+  const TYPE_DELAY_MIN_MS = 100;
+  const TYPE_DELAY_MAX_MS = 300;
+  const PRE_CLICK_MIN_COUNT = 1;
+  const PRE_CLICK_MAX_COUNT = 3;
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -163,6 +171,93 @@
     const low = Math.min(min, max);
     const high = Math.max(min, max);
     return Math.floor(low + Math.random() * (high - low + 1));
+  }
+
+  async function sleepRandom(minMs, maxMs) {
+    await sleep(randomBetween(minMs, maxMs));
+  }
+
+  async function typeTextLikeHuman(input, text, { clear = false } = {}) {
+    if (!input) return;
+    const target = input;
+    target.focus();
+    if (clear) {
+      target.value = '';
+      target.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    const chars = Array.from(text || '');
+    for (const ch of chars) {
+      const key = ch === '\n' ? 'Enter' : ch;
+      target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
+      target.value += ch;
+      target.dispatchEvent(new Event('input', { bubbles: true }));
+      target.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true }));
+      await sleepRandom(TYPE_DELAY_MIN_MS, TYPE_DELAY_MAX_MS);
+    }
+    target.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function isElementInteractable(el) {
+    if (!(el instanceof HTMLElement)) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 6 || rect.height < 6) return false;
+    if (rect.bottom < 0 || rect.top > window.innerHeight) return false;
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none') return false;
+    return true;
+  }
+
+  function isShopdoraElement(el) {
+    if (!(el instanceof HTMLElement)) return false;
+    if (el.closest('[id*="shopdora" i], [class*="shopdora" i]')) return true;
+    return false;
+  }
+
+  async function safeClick(el) {
+    if (!isElementInteractable(el)) return;
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    await sleepRandom(CLICK_DELAY_MIN_MS, CLICK_DELAY_MAX_MS);
+    const prevent = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    el.addEventListener('click', prevent, { capture: true, once: true });
+    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+  }
+
+  function collectRandomClickCandidates() {
+    const selectors = [
+      'input[type="search"]',
+      'input[type="text"]',
+      'textarea',
+      '[role="searchbox"]',
+      '.shopee-searchbar input',
+      'a[href*="cat."]',
+      '.shopee-category-list a',
+      '[data-sqe*="category"]',
+      '[data-sqe*="recommend"]',
+      '[data-sqe*="item"]'
+    ];
+    const nodes = new Set();
+    for (const selector of selectors) {
+      document.querySelectorAll(selector).forEach((el) => nodes.add(el));
+    }
+    return Array.from(nodes).filter((el) => isElementInteractable(el) && !isShopdoraElement(el));
+  }
+
+  async function simulatePreExtractionInteractions() {
+    const candidates = collectRandomClickCandidates();
+    if (!candidates.length) return;
+    const count = randomBetween(PRE_CLICK_MIN_COUNT, PRE_CLICK_MAX_COUNT);
+    const pool = candidates.slice();
+    for (let i = 0; i < count && pool.length; i += 1) {
+      const idx = randomBetween(0, pool.length - 1);
+      const el = pool.splice(idx, 1)[0];
+      await safeClick(el);
+      await sleepRandom(300, 900);
+    }
   }
 
   async function randomScrollJitter(rounds = 2) {
@@ -687,6 +782,7 @@
   }
 
   async function runExtraction() {
+    await simulatePreExtractionInteractions();
     const retryLimit = 3;
     const retryWaitMs = 5000;
     let root = null;
@@ -761,6 +857,8 @@
   const LIST_PAGE_CHANGE_RETRY_WAIT_MS = 1200;
   const LIST_NEXT_BUTTON_WAIT_MS = 15000;
   const LIST_NEXT_BUTTON_POLL_MS = 500;
+  const LIST_BACKTRACK_CHANCE = 0.18;
+  const LIST_BACKTRACK_COOLDOWN_PAGES = 2;
 
   function normalizeUrl(href) {
     if (!href) return null;
@@ -914,6 +1012,31 @@
     }
   }
 
+  async function waitForPageTarget(targetSignature, targetPage, timeoutMs = MAX_WAIT_MS, pollMs = LIST_POLL_INTERVAL_MS) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const signature = getPageSignature();
+      const page = getPageParam();
+      if ((targetSignature && signature === targetSignature) || (targetPage != null && page === targetPage)) {
+        return true;
+      }
+      await sleep(pollMs);
+    }
+    return false;
+  }
+
+  async function simulateBacktrack(prevSignature, prevPage, nextSignature, nextPage) {
+    if (!prevSignature && prevPage == null) return false;
+    history.back();
+    const wentBack = await waitForPageTarget(prevSignature, prevPage, MAX_WAIT_MS / 2);
+    if (!wentBack) return false;
+    await sleepRandom(PAGE_CHANGE_DELAY_MIN_MS, PAGE_CHANGE_DELAY_MAX_MS);
+    history.forward();
+    await waitForPageTarget(nextSignature, nextPage, MAX_WAIT_MS / 2);
+    await sleepRandom(PAGE_CHANGE_DELAY_MIN_MS, PAGE_CHANGE_DELAY_MAX_MS);
+    return true;
+  }
+
   async function waitForPageChange(prevSignature, prevPage, pollMs = LIST_POLL_INTERVAL_MS) {
     const start = Date.now();
     while (Date.now() - start < MAX_WAIT_MS) {
@@ -972,9 +1095,13 @@
   async function clickNextPageWithRetry(nextButton, prevSignature, prevPage) {
     for (let attempt = 1; attempt <= LIST_PAGE_CHANGE_RETRY_LIMIT; attempt += 1) {
       nextButton.scrollIntoView({ block: 'center' });
+      await sleepRandom(CLICK_DELAY_MIN_MS, CLICK_DELAY_MAX_MS);
       nextButton.click();
       const changed = await waitForPageChange(prevSignature, prevPage);
-      if (changed) return changed;
+      if (changed) {
+        await sleepRandom(PAGE_CHANGE_DELAY_MIN_MS, PAGE_CHANGE_DELAY_MAX_MS);
+        return changed;
+      }
       if (attempt < LIST_PAGE_CHANGE_RETRY_LIMIT) {
         await sleep(LIST_PAGE_CHANGE_RETRY_WAIT_MS);
       }
@@ -998,6 +1125,7 @@
     const warnings = [];
     const urls = new Set();
     let pages = 0;
+    let lastBacktrackPage = 0;
     const pageLimit = Number.isFinite(maxPages) && maxPages > 0 ? maxPages : MAX_LIST_PAGES;
 
     const initialItems = await waitForListItems();
@@ -1010,9 +1138,9 @@
 
     while (true) {
       pages += 1;
-      await sleep(LIST_PAGE_DWELL_MS);
+      await sleepRandom(PAGE_CHANGE_DELAY_MIN_MS, PAGE_CHANGE_DELAY_MAX_MS);
       await autoScrollToLoadAllItems();
-      await sleep(LIST_PAGE_DWELL_MS);
+      await sleepRandom(PAGE_CHANGE_DELAY_MIN_MS, PAGE_CHANGE_DELAY_MAX_MS);
 
       let pageUrls = [];
       let contentCount = 0;
@@ -1075,6 +1203,13 @@
         if (changed) {
           const stable = await waitForListStable(signature, prevCount, { forceChange: changed.pageChanged });
           if (stable) {
+            const canBacktrack = pages - lastBacktrackPage >= LIST_BACKTRACK_COOLDOWN_PAGES;
+            if (pages > 0 && canBacktrack && Math.random() < LIST_BACKTRACK_CHANCE) {
+              const didBacktrack = await simulateBacktrack(signature, prevPage, stable.signature, changed.page);
+              if (didBacktrack) {
+                lastBacktrackPage = pages;
+              }
+            }
             advanced = true;
             break;
           }
@@ -1125,6 +1260,19 @@
         paginate: Boolean(message.paginate),
         maxPages: message.maxPages
       }).then(sendResponse);
+      return true;
+    }
+    if (message.type === 'human-type') {
+      const selector = message.selector || '';
+      const text = typeof message.text === 'string' ? message.text : '';
+      const target = selector ? document.querySelector(selector) : null;
+      if (!target || !(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) {
+        sendResponse({ success: false, error: '未找到可输入元素' });
+        return false;
+      }
+      typeTextLikeHuman(target, text, { clear: Boolean(message.clear) })
+        .then(() => sendResponse({ success: true }))
+        .catch((error) => sendResponse({ success: false, error: error?.message || '输入失败' }));
       return true;
     }
   });

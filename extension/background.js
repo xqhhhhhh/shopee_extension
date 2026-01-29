@@ -6,17 +6,27 @@ const DEFAULT_CATEGORY_URL = '';
 const DEFAULT_CACHE_UPDATE_ENABLED = true;
 const MAX_DAILY_DAYS = 120;
 const INCOMPLETE_RETRY_LIMIT = 2;
-const BATCH_REST_EVERY = 5;
-const BATCH_REST_MS = 10 * 1000;
+const BATCH_REST_EVERY = 50;
+const BATCH_REST_MIN_MS = 5 * 60 * 1000;
+const BATCH_REST_MAX_MS = 10 * 60 * 1000;
 const POST_RETRY_ROUNDS = 5;
 const POST_RETRY_DELAY_MS = 2 * 60 * 1000;
 const CATEGORY_CACHE_TTL_HOURS = 24;
 const CATEGORY_CACHE_URL_KEY = 'cachedCategoryUrl';
 const CATEGORY_CACHE_KEY = 'cachedCategoryUrls';
 const CATEGORY_CACHE_UPDATED_AT_KEY = 'cachedCategoryUpdatedAt';
+const SESSION_WINDOW_ID_KEY = 'sessionWindowId';
 const KEEP_AUTO_TABS_OPEN = true;
 const CATEGORY_COLLECT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_DAILY_RUN_MS = 23 * 60 * 60 * 1000;
+const VERIFY_COOLDOWN_MS = 15 * 60 * 1000;
+const ITEM_GAP_MIN_MS = 1200;
+const ITEM_GAP_MAX_MS = 3000;
+const PAGE_SWITCH_DELAY_MIN_MS = 1000;
+const PAGE_SWITCH_DELAY_MAX_MS = 3000;
+const SCHEDULE_MIN_HOUR = 1;
+const SCHEDULE_MAX_HOUR = 23;
+const SCHEDULE_WINDOW_MINUTES = 60;
 let categoryTabId = null;
 const INCOMPLETE_WARNINGS = [
   '未找到卖家名称',
@@ -32,6 +42,11 @@ let running = false;
 let paused = false;
 let concurrency = FIXED_BATCH_CONCURRENCY;
 let pendingDailyRun = false;
+let verifyBlocked = false;
+let verifyBlockedUrl = null;
+let verifyBlockedUntil = null;
+let verifyBlockedPrevPaused = false;
+let sessionWindowId = null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -49,6 +64,100 @@ function storageSet(values) {
   });
 }
 
+function tabsQuery(queryInfo) {
+  return new Promise((resolve) => {
+    chrome.tabs.query(queryInfo, (tabs) => resolve(tabs || []));
+  });
+}
+
+async function loadSessionWindowId() {
+  const data = await storageGet([SESSION_WINDOW_ID_KEY]);
+  const stored = data[SESSION_WINDOW_ID_KEY];
+  sessionWindowId = Number.isFinite(stored) ? stored : null;
+}
+
+function setSessionWindowId(windowId) {
+  if (!Number.isFinite(windowId)) return;
+  sessionWindowId = windowId;
+  storageSet({ [SESSION_WINDOW_ID_KEY]: windowId });
+}
+
+async function resolveSessionWindowId() {
+  if (Number.isFinite(sessionWindowId)) return sessionWindowId;
+  const [active] = await tabsQuery({ active: true, lastFocusedWindow: true });
+  if (active && !active.incognito) {
+    setSessionWindowId(active.windowId);
+    return active.windowId;
+  }
+  const tabs = await tabsQuery({});
+  const normal = tabs.find((tab) => tab && !tab.incognito);
+  if (normal) {
+    setSessionWindowId(normal.windowId);
+    return normal.windowId;
+  }
+  return null;
+}
+
+function isVerifyUrl(url) {
+  if (!url) return false;
+  return /\/verify\/(traffic|captcha|error)/i.test(url);
+}
+
+async function hydrateVerifyState() {
+  const data = await storageGet(['verifyBlocked', 'verifyBlockedUrl', 'verifyBlockedUntil']);
+  verifyBlocked = Boolean(data.verifyBlocked);
+  verifyBlockedUrl = data.verifyBlockedUrl || null;
+  verifyBlockedUntil = data.verifyBlockedUntil ? new Date(data.verifyBlockedUntil).getTime() : null;
+  if (verifyBlocked && verifyBlockedUntil && Date.now() >= verifyBlockedUntil) {
+    await clearVerifyBlocked();
+  }
+}
+
+async function setVerifyBlocked(url) {
+  if (verifyBlocked) return;
+  verifyBlocked = true;
+  verifyBlockedUrl = url || null;
+  verifyBlockedUntil = Date.now() + VERIFY_COOLDOWN_MS;
+  verifyBlockedPrevPaused = paused;
+  paused = true;
+  saveBatchState();
+  await storageSet({
+    verifyBlocked: true,
+    verifyBlockedUrl: verifyBlockedUrl,
+    verifyBlockedUntil: new Date(verifyBlockedUntil).toISOString()
+  });
+  chrome.runtime.sendMessage({
+    type: 'verify-blocked',
+    url: verifyBlockedUrl,
+    until: verifyBlockedUntil
+  });
+}
+
+async function clearVerifyBlocked() {
+  verifyBlocked = false;
+  verifyBlockedUrl = null;
+  verifyBlockedUntil = null;
+  paused = verifyBlockedPrevPaused;
+  verifyBlockedPrevPaused = false;
+  saveBatchState();
+  await storageSet({
+    verifyBlocked: false,
+    verifyBlockedUrl: null,
+    verifyBlockedUntil: null
+  });
+  chrome.runtime.sendMessage({ type: 'verify-clear' });
+}
+
+async function waitForVerifyClear() {
+  while (verifyBlocked) {
+    if (verifyBlockedUntil && Date.now() >= verifyBlockedUntil) {
+      await clearVerifyBlocked();
+      break;
+    }
+    await sleep(1000);
+  }
+}
+
 function toYmd(date) {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, '0');
@@ -59,9 +168,66 @@ function toYmd(date) {
 function parseScheduleTime(timeText) {
   if (!timeText || !/^\d{2}:\d{2}$/.test(timeText)) return { hours: 2, minutes: 0 };
   const [hoursStr, minutesStr] = timeText.split(':');
-  const hours = Math.min(23, Math.max(0, Number.parseInt(hoursStr, 10)));
-  const minutes = Math.min(59, Math.max(0, Number.parseInt(minutesStr, 10)));
+  let hours = Number.parseInt(hoursStr, 10);
+  let minutes = Number.parseInt(minutesStr, 10);
+  hours = Number.isFinite(hours) ? hours : 2;
+  minutes = Number.isFinite(minutes) ? minutes : 0;
+  if (hours < SCHEDULE_MIN_HOUR) {
+    hours = SCHEDULE_MIN_HOUR;
+    minutes = 0;
+  }
+  if (hours > SCHEDULE_MAX_HOUR) {
+    hours = SCHEDULE_MAX_HOUR;
+    minutes = 0;
+  }
+  minutes = Math.min(59, Math.max(0, minutes));
+  if (hours === SCHEDULE_MAX_HOUR && minutes > 0) {
+    minutes = 0;
+  }
   return { hours, minutes };
+}
+
+function getScheduleWindow(date, timeText) {
+  const { hours, minutes } = parseScheduleTime(timeText);
+  const base = new Date(date);
+  base.setHours(hours, minutes, 0, 0);
+  const start = new Date(base);
+  start.setMinutes(start.getMinutes() - SCHEDULE_WINDOW_MINUTES);
+  const end = new Date(base);
+  end.setMinutes(end.getMinutes() + SCHEDULE_WINDOW_MINUTES);
+
+  const minAllowed = new Date(date);
+  minAllowed.setHours(SCHEDULE_MIN_HOUR, 0, 0, 0);
+  const maxAllowed = new Date(date);
+  maxAllowed.setHours(SCHEDULE_MAX_HOUR, 0, 0, 0);
+
+  const windowStart = new Date(Math.max(start.getTime(), minAllowed.getTime()));
+  const windowEnd = new Date(Math.min(end.getTime(), maxAllowed.getTime()));
+  return { start: windowStart, end: windowEnd };
+}
+
+function randomTimeBetween(start, end) {
+  const startMs = start.getTime();
+  const endMs = end.getTime();
+  if (startMs >= endMs) return startMs;
+  return randomBetween(startMs, endMs);
+}
+
+function pickRandomRunTime(timeText, now = new Date()) {
+  const todayWindow = getScheduleWindow(now, timeText);
+  const nowMs = now.getTime();
+  const todayEndMs = todayWindow.end.getTime();
+  if (nowMs <= todayEndMs) {
+    const earliestMs = Math.max(todayWindow.start.getTime(), nowMs + 1000);
+    if (earliestMs <= todayEndMs) {
+      return randomTimeBetween(new Date(earliestMs), todayWindow.end);
+    }
+  }
+
+  const tomorrow = new Date(now);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const tomorrowWindow = getScheduleWindow(tomorrow, timeText);
+  return randomTimeBetween(tomorrowWindow.start, tomorrowWindow.end);
 }
 
 async function loadCategoryCache(categoryUrl) {
@@ -95,14 +261,7 @@ async function saveCategoryCache(categoryUrl, urls) {
 }
 
 function nextRunAt(timeText) {
-  const now = new Date();
-  const { hours, minutes } = parseScheduleTime(timeText);
-  const next = new Date(now);
-  next.setHours(hours, minutes, 0, 0);
-  if (next <= now) {
-    next.setDate(next.getDate() + 1);
-  }
-  return next.getTime();
+  return pickRandomRunTime(timeText, new Date());
 }
 
 async function loadConfig() {
@@ -111,7 +270,8 @@ async function loadConfig() {
     'categoryUrl',
     'cacheUpdateEnabled',
     'lastRunDate',
-    'lastRunAt'
+    'lastRunAt',
+    SESSION_WINDOW_ID_KEY
   ]);
   const scheduleTime = data.scheduleTime || DEFAULT_SCHEDULE_TIME;
   const categoryUrl = data.categoryUrl || DEFAULT_CATEGORY_URL;
@@ -124,7 +284,8 @@ async function loadConfig() {
     lastRunDate: data.lastRunDate || null,
     lastRunAt: data.lastRunAt || null,
     cacheUpdateEnabled,
-    concurrency
+    concurrency,
+    sessionWindowId: Number.isFinite(data[SESSION_WINDOW_ID_KEY]) ? data[SESSION_WINDOW_ID_KEY] : null
   };
 }
 
@@ -138,10 +299,8 @@ function shouldRunMissed(scheduleTime, lastRunDate) {
   const now = new Date();
   const today = toYmd(now);
   if (lastRunDate === today) return false;
-  const { hours, minutes } = parseScheduleTime(scheduleTime);
-  const target = new Date(now);
-  target.setHours(hours, minutes, 0, 0);
-  return now >= target;
+  const window = getScheduleWindow(now, scheduleTime);
+  return now >= window.end;
 }
 function saveBatchState({ saveResults = true } = {}) {
   const payload = {
@@ -248,11 +407,11 @@ async function updateCategoryCache(categoryUrl, urls) {
   await saveCategoryCache(categoryUrl, merged);
 }
 
-async function ensureCategoryTab(categoryUrl) {
+async function ensureCategoryTab(categoryUrl, windowId) {
   if (categoryTabId) {
     try {
       const existing = await chrome.tabs.get(categoryTabId);
-      if (existing && existing.id) {
+      if (existing && existing.id && !existing.incognito) {
         await chrome.tabs.update(existing.id, { url: categoryUrl, active: true });
         return existing;
       }
@@ -264,7 +423,7 @@ async function ensureCategoryTab(categoryUrl) {
   const pattern = buildUrlPattern(categoryUrl);
   if (pattern) {
     const tabs = await chrome.tabs.query({ url: [pattern] });
-    const tab = tabs.find((item) => item && item.id);
+    const tab = tabs.find((item) => item && item.id && !item.incognito);
     if (tab && tab.id) {
       categoryTabId = tab.id;
       await chrome.tabs.update(tab.id, { url: categoryUrl, active: true });
@@ -272,7 +431,11 @@ async function ensureCategoryTab(categoryUrl) {
     }
   }
 
-  const created = await chrome.tabs.create({ url: categoryUrl, active: true });
+  const createOptions = { url: categoryUrl, active: true };
+  if (Number.isFinite(windowId)) {
+    createOptions.windowId = windowId;
+  }
+  const created = await chrome.tabs.create(createOptions);
   categoryTabId = created.id || null;
   return created;
 }
@@ -315,7 +478,7 @@ async function restartWorkerTab(tabId) {
   if (!tabId) return null;
   try {
     const existing = await chrome.tabs.get(tabId);
-    if (!existing) return null;
+    if (!existing || existing.incognito) return null;
     const created = await chrome.tabs.create({
       url: 'about:blank',
       active: false,
@@ -352,13 +515,34 @@ async function extractFromUrl(url, existingTabId) {
   let tabId = existingTabId;
   try {
     if (!tabId) {
-      const tab = await chrome.tabs.create({ url, active: true });
+      const windowId = await resolveSessionWindowId();
+      const createOptions = { url, active: true };
+      if (Number.isFinite(windowId)) {
+        createOptions.windowId = windowId;
+      }
+      const tab = await chrome.tabs.create(createOptions);
       tabId = tab.id;
+      if (tab.incognito) {
+        await safeCloseTab(tabId);
+        return { result: { success: false, error: '当前为无痕窗口，无法共享登录态' }, tabId: null };
+      }
     } else {
+      const current = await chrome.tabs.get(tabId);
+      if (current?.incognito) {
+        return { result: { success: false, error: '当前为无痕窗口，无法共享登录态' }, tabId };
+      }
       await chrome.tabs.update(tabId, { url, active: true });
     }
     await waitForTabComplete(tabId, url);
-    await sleep(1200);
+    const tab = await chrome.tabs.get(tabId);
+    if (tab?.incognito) {
+      return { result: { success: false, error: '当前为无痕窗口，无法共享登录态' }, tabId };
+    }
+    if (isVerifyUrl(tab?.url)) {
+      await setVerifyBlocked(tab.url);
+      return { result: { success: false, error: '触发验证页', blocked: true }, tabId };
+    }
+    await sleep(randomBetween(PAGE_SWITCH_DELAY_MIN_MS, PAGE_SWITCH_DELAY_MAX_MS));
     const response = await sendMessageToTab(tabId, { type: 'extract' }, BATCH_TIMEOUT_MS);
     return { result: response || { success: false, error: '无响应' }, tabId };
   } catch (error) {
@@ -367,10 +551,22 @@ async function extractFromUrl(url, existingTabId) {
 }
 
 async function collectCategoryUrls(categoryUrl, timeoutMs = CATEGORY_COLLECT_TIMEOUT_MS) {
-  const tab = await ensureCategoryTab(categoryUrl);
+  const windowId = await resolveSessionWindowId();
+  const tab = await ensureCategoryTab(categoryUrl, windowId);
   try {
+    if (tab?.incognito) {
+      return { success: false, error: '当前为无痕窗口，无法共享登录态' };
+    }
     await waitForTabComplete(tab.id, categoryUrl);
-    await sleep(1200);
+    const current = await chrome.tabs.get(tab.id);
+    if (current?.incognito) {
+      return { success: false, error: '当前为无痕窗口，无法共享登录态' };
+    }
+    if (isVerifyUrl(current?.url)) {
+      await setVerifyBlocked(current.url);
+      return { success: false, error: '触发验证页', blocked: true };
+    }
+    await sleep(randomBetween(PAGE_SWITCH_DELAY_MIN_MS, PAGE_SWITCH_DELAY_MAX_MS));
     const response = await sendMessageToTab(tab.id, {
       type: 'collect-product-urls',
       paginate: true,
@@ -427,6 +623,8 @@ async function processQueue({
 } = {}) {
   if (running) return;
   running = true;
+  await hydrateVerifyState();
+  await loadSessionWindowId();
   if (recordResults) {
     results = [];
   }
@@ -446,6 +644,10 @@ async function processQueue({
     let tabId = null;
     try {
       while (true) {
+        if (verifyBlocked) {
+          await waitForVerifyClear();
+          if (verifyBlocked) continue;
+        }
         if (isDeadlineReached()) {
           stoppedByDeadline = true;
           break;
@@ -457,10 +659,14 @@ async function processQueue({
         }
         const url = queue.shift();
         if (!url) continue;
-        index += 1;
-        processedCount += 1;
         const { result, tabId: nextTabId } = await extractFromUrl(url, tabId);
         tabId = nextTabId;
+        if (result?.blocked) {
+          queue.unshift(url);
+          continue;
+        }
+        index += 1;
+        processedCount += 1;
         const payload = {
           url,
           index,
@@ -487,6 +693,15 @@ async function processQueue({
           }
         }
 
+        if (processedCount % BATCH_REST_EVERY !== 0) {
+          const gapMs = randomBetween(ITEM_GAP_MIN_MS, ITEM_GAP_MAX_MS);
+          if (isDeadlineReached()) {
+            stoppedByDeadline = true;
+            break;
+          }
+          await sleep(gapMs);
+        }
+
         if (processedCount % BATCH_REST_EVERY === 0) {
           if (isDeadlineReached()) {
             stoppedByDeadline = true;
@@ -495,7 +710,7 @@ async function processQueue({
           if (tabId != null) {
             tabId = await restartWorkerTab(tabId);
           }
-          await sleep(BATCH_REST_MS);
+          await sleep(randomBetween(BATCH_REST_MIN_MS, BATCH_REST_MAX_MS));
         }
       }
     } finally {
@@ -556,6 +771,7 @@ async function runDailyJob(source) {
     return;
   }
 
+  await loadSessionWindowId();
   const config = await loadConfig();
   if (!config.categoryUrl) {
     return;
@@ -664,6 +880,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message) return;
 
   if (message.type === 'batch-start') {
+    if (message.incognito) {
+      sendResponse({ started: false, error: '当前为无痕窗口，无法共享登录态' });
+      return;
+    }
+    if (Number.isFinite(message.windowId)) {
+      setSessionWindowId(message.windowId);
+    }
     queue = (message.urls || []).filter(Boolean);
     if (!queue.length) {
       sendResponse({ started: false, error: 'URL列表为空' });
@@ -716,6 +939,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const categoryUrl = (message.categoryUrl || '').trim();
     const cacheUpdateEnabled =
       typeof message.cacheUpdateEnabled === 'boolean' ? message.cacheUpdateEnabled : DEFAULT_CACHE_UPDATE_ENABLED;
+    if (!message.incognito && Number.isFinite(message.windowId)) {
+      setSessionWindowId(message.windowId);
+    }
     storageSet({ scheduleTime, categoryUrl, cacheUpdateEnabled }).then(async () => {
       await scheduleDailyAlarm(scheduleTime);
       sendResponse({ ok: true });
@@ -725,7 +951,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'config-status') {
     loadConfig().then((config) => {
-      storageGet(['nextRunAt']).then((data) => {
+      storageGet(['nextRunAt', 'verifyBlocked', 'verifyBlockedUrl', 'verifyBlockedUntil']).then((data) => {
         sendResponse({
           scheduleTime: config.scheduleTime,
           categoryUrl: config.categoryUrl,
@@ -733,16 +959,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           lastRunDate: config.lastRunDate,
           nextRunAt: data.nextRunAt || null,
           running,
-          cacheUpdateEnabled: config.cacheUpdateEnabled
+          cacheUpdateEnabled: config.cacheUpdateEnabled,
+          verifyBlocked: Boolean(data.verifyBlocked),
+          verifyBlockedUrl: data.verifyBlockedUrl || null,
+          verifyBlockedUntil: data.verifyBlockedUntil || null
         });
       });
     });
     return true;
   }
 
+  if (message.type === 'verify-resume') {
+    clearVerifyBlocked().then(() => {
+      sendResponse({ ok: true });
+    });
+    return true;
+  }
+
   if (message.type === 'daily-run-now') {
+    if (!message.incognito && Number.isFinite(message.windowId)) {
+      setSessionWindowId(message.windowId);
+    }
     runDailyJob('manual');
     sendResponse({ started: true });
+    return true;
+  }
+
+  if (message.type === 'session-bind') {
+    if (!message.incognito && Number.isFinite(message.windowId)) {
+      setSessionWindowId(message.windowId);
+    }
+    sendResponse({ ok: true });
     return true;
   }
 });

@@ -17,6 +17,9 @@ const scheduleInfoEl = document.getElementById('scheduleInfo');
 const fixedListHintEl = document.getElementById('fixedListHint');
 const autoCategoryHintEl = document.getElementById('autoCategoryHint');
 const autoStatusEl = document.getElementById('autoStatus');
+const verifyBlockEl = document.getElementById('verifyBlock');
+const verifyBlockTextEl = document.getElementById('verifyBlockText');
+const verifyResumeBtn = document.getElementById('verifyResume');
 const cacheUpdateEnabledEl = document.getElementById('cacheUpdateEnabled');
 const downloadHistoryCsvBtn = document.getElementById('downloadHistoryCsv');
 const viewCacheBtn = document.getElementById('viewCache');
@@ -90,8 +93,9 @@ function setActiveTab(tabName) {
 
 function restoreActiveTab() {
   const saved = localStorage.getItem(TAB_STORAGE_KEY);
-  const fallback = tabButtons.length ? tabButtons[0].dataset.tab : null;
-  const target = saved || fallback;
+  const availableTabs = tabButtons.map((button) => button.dataset.tab).filter(Boolean);
+  const fallback = availableTabs.length ? availableTabs[0] : null;
+  const target = availableTabs.includes(saved) ? saved : fallback;
   if (target) setActiveTab(target);
 }
 
@@ -110,6 +114,16 @@ function tabsCreate(createProperties) {
 function tabsUpdate(tabId, updateProperties) {
   return new Promise((resolve) => {
     chrome.tabs.update(tabId, updateProperties, (tab) => resolve(tab));
+  });
+}
+
+async function bindSessionContext() {
+  const [tab] = await tabsQuery({ active: true, currentWindow: true });
+  if (!tab) return;
+  chrome.runtime.sendMessage({
+    type: 'session-bind',
+    windowId: tab.windowId,
+    incognito: tab.incognito
   });
 }
 
@@ -135,7 +149,7 @@ function waitForTabComplete(tabId, urlMatch) {
 
 async function ensureFixedListTab() {
   const tabs = await tabsQuery({ url: FIXED_LIST_URL_PATTERN });
-  let tab = tabs.find((item) => item && item.id);
+  let tab = tabs.find((item) => item && item.id && !item.incognito);
 
   if (tab && tab.id) {
     if (tab.url !== FIXED_LIST_URL) {
@@ -148,6 +162,7 @@ async function ensureFixedListTab() {
   }
 
   if (!tab || !tab.id) return null;
+  if (tab.incognito) return null;
   if (tab.status === 'complete' && tab.url && tab.url.startsWith(FIXED_LIST_URL)) {
     return tab;
   }
@@ -231,6 +246,26 @@ function setAutoStatus(text) {
   if (autoStatusEl) {
     autoStatusEl.textContent = text;
   }
+}
+
+function showVerifyBlock({ url, until } = {}) {
+  if (!verifyBlockEl) return;
+  verifyBlockEl.classList.remove('is-hidden');
+  const parts = [];
+  if (url) parts.push(`URL: ${url}`);
+  if (until) {
+    const untilText = typeof until === 'string' ? new Date(until).toLocaleString() : new Date(until).toLocaleString();
+    parts.push(`自动解锁: ${untilText}`);
+  }
+  if (verifyBlockTextEl) {
+    verifyBlockTextEl.textContent = parts.join(' | ') || '触发验证页，请手动完成验证后继续';
+  }
+}
+
+function hideVerifyBlock() {
+  if (!verifyBlockEl) return;
+  verifyBlockEl.classList.add('is-hidden');
+  if (verifyBlockTextEl) verifyBlockTextEl.textContent = '';
 }
 
 function updateFilterDownloadButton() {
@@ -584,6 +619,10 @@ extractCurrentBtn.addEventListener('click', async () => {
     setOutput('未找到当前标签页');
     return;
   }
+  if (tab.incognito) {
+    setOutput('当前为无痕窗口，无法共享登录态');
+    return;
+  }
 
   chrome.tabs.sendMessage(tab.id, { type: 'extract' }, (response) => {
     const err = chrome.runtime.lastError;
@@ -595,7 +634,7 @@ extractCurrentBtn.addEventListener('click', async () => {
   });
 });
 
-extractBatchBtn.addEventListener('click', () => {
+extractBatchBtn.addEventListener('click', async () => {
   const urls = importedUrls.filter(Boolean);
 
   if (!urls.length) {
@@ -608,7 +647,14 @@ extractBatchBtn.addEventListener('click', () => {
   setOutput('批量提取中...');
   persistResults();
 
-  chrome.runtime.sendMessage({ type: 'batch-start', urls, concurrency: FIXED_BATCH_CONCURRENCY }, (response) => {
+  const [tab] = await tabsQuery({ active: true, currentWindow: true });
+  chrome.runtime.sendMessage({
+    type: 'batch-start',
+    urls,
+    concurrency: FIXED_BATCH_CONCURRENCY,
+    windowId: tab?.windowId,
+    incognito: tab?.incognito
+  }, (response) => {
     if (!response || !response.started) {
       setOutput(`批量启动失败: ${response?.error || '未知错误'}`);
       batchRunning = false;
@@ -655,17 +701,25 @@ importUrlsBtn.addEventListener('click', () => {
   reader.readAsText(file);
 });
 
-saveScheduleBtn.addEventListener('click', () => {
+saveScheduleBtn.addEventListener('click', async () => {
   const scheduleTime = scheduleTimeEl.value || '02:00';
   const categoryUrl = AUTO_CATEGORY_URL;
   const cacheUpdateEnabled = cacheUpdateEnabledEl ? Boolean(cacheUpdateEnabledEl.checked) : true;
+  const [tab] = await tabsQuery({ active: true, currentWindow: true });
   storageSet({
     [STORAGE_KEYS.scheduleTime]: scheduleTime,
     categoryUrl,
     [STORAGE_KEYS.cacheUpdateEnabled]: cacheUpdateEnabled
   }).then(() => {
     chrome.runtime.sendMessage(
-      { type: 'config-update', scheduleTime, categoryUrl, cacheUpdateEnabled },
+      {
+        type: 'config-update',
+        scheduleTime,
+        categoryUrl,
+        cacheUpdateEnabled,
+        windowId: tab?.windowId,
+        incognito: tab?.incognito
+      },
       (response) => {
         if (!response || !response.ok) {
           setAutoStatus('自动抓取配置保存失败');
@@ -681,18 +735,39 @@ saveScheduleBtn.addEventListener('click', () => {
   });
 });
 
-runDailyNowBtn.addEventListener('click', () => {
+runDailyNowBtn.addEventListener('click', async () => {
   const scheduleTime = scheduleTimeEl.value || '02:00';
   const cacheUpdateEnabled = cacheUpdateEnabledEl ? Boolean(cacheUpdateEnabledEl.checked) : true;
+  const [tab] = await tabsQuery({ active: true, currentWindow: true });
   chrome.runtime.sendMessage(
-    { type: 'config-update', scheduleTime, categoryUrl: AUTO_CATEGORY_URL, cacheUpdateEnabled },
+    {
+      type: 'config-update',
+      scheduleTime,
+      categoryUrl: AUTO_CATEGORY_URL,
+      cacheUpdateEnabled,
+      windowId: tab?.windowId,
+      incognito: tab?.incognito
+    },
     () => {
-      chrome.runtime.sendMessage({ type: 'daily-run-now' }, () => {
+      chrome.runtime.sendMessage({
+        type: 'daily-run-now',
+        windowId: tab?.windowId,
+        incognito: tab?.incognito
+      }, () => {
         setAutoStatus('已触发自动抓取任务');
       });
     }
   );
 });
+
+if (verifyResumeBtn) {
+  verifyResumeBtn.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ type: 'verify-resume' }, () => {
+      setAutoStatus('已恢复抓取');
+      hideVerifyBlock();
+    });
+  });
+}
 
 runFilterBtn.addEventListener('click', async () => {
   setFilterOutput('筛选中...');
@@ -831,7 +906,11 @@ extractListBtn.addEventListener('click', async () => {
   }
 
   if (!tab || !tab.id) {
-    setListOutput('未能打开固定分类页');
+    setListOutput('未能打开固定分类页（请使用非无痕窗口）');
+    return;
+  }
+  if (tab.incognito) {
+    setListOutput('当前为无痕窗口，无法共享登录态');
     return;
   }
 
@@ -890,6 +969,14 @@ chrome.runtime.onMessage.addListener((message) => {
     updatePauseButton();
     persistResults();
   }
+  if (message.type === 'verify-blocked') {
+    showVerifyBlock({ url: message.url, until: message.until });
+    setAutoStatus('触发验证页，已暂停抓取');
+  }
+  if (message.type === 'verify-clear') {
+    hideVerifyBlock();
+    setAutoStatus('验证已清除，抓取已继续');
+  }
 });
 
 downloadJsonBtn.addEventListener('click', () => {
@@ -912,6 +999,7 @@ updateUrlDownloadButton();
 updatePauseButton();
 updateFilterDownloadButton();
 
+bindSessionContext();
 
 if (tabButtons.length) {
   tabButtons.forEach((button) => {
@@ -991,6 +1079,11 @@ async function restoreState() {
       cacheUpdateEnabledEl.checked = status.cacheUpdateEnabled;
     }
     updateScheduleInfo({ lastRunAt: status.lastRunAt, nextRunAt: status.nextRunAt });
+    if (status.verifyBlocked) {
+      showVerifyBlock({ url: status.verifyBlockedUrl, until: status.verifyBlockedUntil });
+    } else {
+      hideVerifyBlock();
+    }
   });
 }
 
