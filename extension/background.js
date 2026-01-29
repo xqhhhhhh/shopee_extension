@@ -3,17 +3,20 @@ const FIXED_BATCH_CONCURRENCY = 1;
 const DAILY_ALARM_NAME = 'daily-crawl';
 const DEFAULT_SCHEDULE_TIME = '02:00';
 const DEFAULT_CATEGORY_URL = '';
+const DEFAULT_CACHE_UPDATE_ENABLED = true;
 const MAX_DAILY_DAYS = 120;
 const INCOMPLETE_RETRY_LIMIT = 2;
 const BATCH_REST_EVERY = 5;
-const BATCH_REST_MIN_MS = 10 * 1000;
-const BATCH_REST_MAX_MS = 60 * 1000;
+const BATCH_REST_MS = 10 * 1000;
+const POST_RETRY_ROUNDS = 5;
+const POST_RETRY_DELAY_MS = 2 * 60 * 1000;
 const CATEGORY_CACHE_TTL_HOURS = 24;
 const CATEGORY_CACHE_URL_KEY = 'cachedCategoryUrl';
 const CATEGORY_CACHE_KEY = 'cachedCategoryUrls';
 const CATEGORY_CACHE_UPDATED_AT_KEY = 'cachedCategoryUpdatedAt';
 const KEEP_AUTO_TABS_OPEN = true;
 const CATEGORY_COLLECT_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_DAILY_RUN_MS = 23 * 60 * 60 * 1000;
 let categoryTabId = null;
 const INCOMPLETE_WARNINGS = [
   '未找到卖家名称',
@@ -106,17 +109,21 @@ async function loadConfig() {
   const data = await storageGet([
     'scheduleTime',
     'categoryUrl',
+    'cacheUpdateEnabled',
     'lastRunDate',
     'lastRunAt'
   ]);
   const scheduleTime = data.scheduleTime || DEFAULT_SCHEDULE_TIME;
   const categoryUrl = data.categoryUrl || DEFAULT_CATEGORY_URL;
   concurrency = FIXED_BATCH_CONCURRENCY;
+  const cacheUpdateEnabled =
+    typeof data.cacheUpdateEnabled === 'boolean' ? data.cacheUpdateEnabled : DEFAULT_CACHE_UPDATE_ENABLED;
   return {
     scheduleTime,
     categoryUrl,
     lastRunDate: data.lastRunDate || null,
     lastRunAt: data.lastRunAt || null,
+    cacheUpdateEnabled,
     concurrency
   };
 }
@@ -297,6 +304,30 @@ function safeCloseTab(tabId) {
   });
 }
 
+function forceCloseTab(tabId) {
+  if (!tabId) return Promise.resolve();
+  return new Promise((resolve) => {
+    chrome.tabs.remove(tabId, () => resolve());
+  });
+}
+
+async function restartWorkerTab(tabId) {
+  if (!tabId) return null;
+  try {
+    const existing = await chrome.tabs.get(tabId);
+    if (!existing) return null;
+    const created = await chrome.tabs.create({
+      url: 'about:blank',
+      active: false,
+      windowId: existing.windowId
+    });
+    await forceCloseTab(tabId);
+    return created?.id ?? null;
+  } catch (error) {
+    return null;
+  }
+}
+
 function isIncompleteResult(result) {
   if (!result || !result.success || !result.data) return false;
   const data = result.data;
@@ -309,6 +340,12 @@ function isIncompleteResult(result) {
     !Array.isArray(data.sku) ||
     data.sku.length === 0;
   return hasMissingWarning || missingCoreFields;
+}
+
+function shouldRetryAfterRun(result) {
+  if (!result || !result.success || !result.data) return false;
+  if (!result.data.productId) return false;
+  return isIncompleteResult(result);
 }
 
 async function extractFromUrl(url, existingTabId) {
@@ -329,7 +366,7 @@ async function extractFromUrl(url, existingTabId) {
   }
 }
 
-async function collectCategoryUrls(categoryUrl) {
+async function collectCategoryUrls(categoryUrl, timeoutMs = CATEGORY_COLLECT_TIMEOUT_MS) {
   const tab = await ensureCategoryTab(categoryUrl);
   try {
     await waitForTabComplete(tab.id, categoryUrl);
@@ -338,7 +375,7 @@ async function collectCategoryUrls(categoryUrl) {
       type: 'collect-product-urls',
       paginate: true,
       maxPages: 50
-    }, CATEGORY_COLLECT_TIMEOUT_MS);
+    }, timeoutMs);
     return response || { success: false, error: '无响应' };
   } catch (error) {
     return { success: false, error: error.message || '未知错误' };
@@ -381,7 +418,13 @@ async function saveDailySnapshots(newRecords) {
   await storageSet({ dailySnapshots: merged });
 }
 
-async function processQueue({ emitEvents = true, recordResults = true, allowPause = true, onItem } = {}) {
+async function processQueue({
+  emitEvents = true,
+  recordResults = true,
+  allowPause = true,
+  onItem,
+  deadlineMs
+} = {}) {
   if (running) return;
   running = true;
   if (recordResults) {
@@ -389,7 +432,10 @@ async function processQueue({ emitEvents = true, recordResults = true, allowPaus
   }
   saveBatchState({ saveResults: recordResults });
 
-  const total = queue.length;
+  const isDeadlineReached = () => Number.isFinite(deadlineMs) && Date.now() >= deadlineMs;
+  let stoppedByDeadline = false;
+
+  let total = queue.length;
   let index = 0;
   const workerCount = Math.max(1, Math.min(concurrency, total || 1));
   const retryCounts = new Map();
@@ -400,6 +446,10 @@ async function processQueue({ emitEvents = true, recordResults = true, allowPaus
     let tabId = null;
     try {
       while (true) {
+        if (isDeadlineReached()) {
+          stoppedByDeadline = true;
+          break;
+        }
         if (queue.length === 0) break;
         if (allowPause && paused) {
           await sleep(300);
@@ -438,8 +488,14 @@ async function processQueue({ emitEvents = true, recordResults = true, allowPaus
         }
 
         if (processedCount % BATCH_REST_EVERY === 0) {
-          const restMs = randomBetween(BATCH_REST_MIN_MS, BATCH_REST_MAX_MS);
-          await sleep(restMs);
+          if (isDeadlineReached()) {
+            stoppedByDeadline = true;
+            break;
+          }
+          if (tabId != null) {
+            tabId = await restartWorkerTab(tabId);
+          }
+          await sleep(BATCH_REST_MS);
         }
       }
     } finally {
@@ -449,8 +505,38 @@ async function processQueue({ emitEvents = true, recordResults = true, allowPaus
     }
   }
 
-  const workers = Array.from({ length: workerCount }, () => runWorker());
-  await Promise.all(workers);
+  async function runRound() {
+    if (isDeadlineReached()) {
+      stoppedByDeadline = true;
+      return;
+    }
+    const currentWorkers = Array.from({ length: workerCount }, () => runWorker());
+    await Promise.all(currentWorkers);
+  }
+
+  await runRound();
+
+  for (let round = 1; round <= POST_RETRY_ROUNDS; round += 1) {
+    if (isDeadlineReached()) {
+      stoppedByDeadline = true;
+      break;
+    }
+    const retryUrls = Array.from(latestResults.values())
+      .filter((payload) => shouldRetryAfterRun(payload?.result))
+      .map((payload) => payload.url)
+      .filter(Boolean);
+
+    if (!retryUrls.length) break;
+    queue = Array.from(new Set(retryUrls));
+    total += queue.length;
+    if (isDeadlineReached()) {
+      stoppedByDeadline = true;
+      break;
+    }
+    await sleep(POST_RETRY_DELAY_MS);
+    await runRound();
+    if (stoppedByDeadline) break;
+  }
 
   if (emitEvents) {
     chrome.runtime.sendMessage({ type: 'batch-complete', results });
@@ -474,9 +560,12 @@ async function runDailyJob(source) {
   if (!config.categoryUrl) {
     return;
   }
+  const deadlineMs = Date.now() + MAX_DAILY_RUN_MS;
+  const remainingMs = () => Math.max(0, deadlineMs - Date.now());
 
   const cache = await loadCategoryCache(config.categoryUrl);
   const forceRefresh = source === 'manual';
+  const cacheUpdateEnabled = config.cacheUpdateEnabled !== false;
   let cachedUrls = cache.urls.slice();
   let listResult = null;
 
@@ -485,8 +574,14 @@ async function runDailyJob(source) {
     await saveCategoryCache(config.categoryUrl, cachedUrls);
   }
 
-  if (forceRefresh || !cache.fresh || !cachedUrls.length) {
-    listResult = await collectCategoryUrls(config.categoryUrl);
+  if (cacheUpdateEnabled && (forceRefresh || !cache.fresh || !cachedUrls.length)) {
+    const leftMs = remainingMs();
+    if (leftMs <= 0) {
+      await scheduleDailyAlarm(config.scheduleTime);
+      return;
+    }
+    const timeoutMs = Math.min(CATEGORY_COLLECT_TIMEOUT_MS, leftMs);
+    listResult = await collectCategoryUrls(config.categoryUrl, timeoutMs);
     if (listResult?.success && Array.isArray(listResult.urls) && listResult.urls.length) {
       const merged = new Set([...cachedUrls, ...listResult.urls]);
       cachedUrls = Array.from(merged);
@@ -500,6 +595,7 @@ async function runDailyJob(source) {
   }
 
   if (!cachedUrls.length) {
+    await scheduleDailyAlarm(config.scheduleTime);
     return;
   }
 
@@ -514,6 +610,7 @@ async function runDailyJob(source) {
     emitEvents: source === 'manual',
     recordResults: true,
     allowPause: false,
+    deadlineMs,
     onItem: (payload) => {
       if (payload?.result?.success && payload.result.data) {
         const record = buildDailyRecord(payload.result.data, dateStr);
@@ -617,7 +714,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'config-update') {
     const scheduleTime = message.scheduleTime || DEFAULT_SCHEDULE_TIME;
     const categoryUrl = (message.categoryUrl || '').trim();
-    storageSet({ scheduleTime, categoryUrl }).then(async () => {
+    const cacheUpdateEnabled =
+      typeof message.cacheUpdateEnabled === 'boolean' ? message.cacheUpdateEnabled : DEFAULT_CACHE_UPDATE_ENABLED;
+    storageSet({ scheduleTime, categoryUrl, cacheUpdateEnabled }).then(async () => {
       await scheduleDailyAlarm(scheduleTime);
       sendResponse({ ok: true });
     });
@@ -633,7 +732,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           lastRunAt: config.lastRunAt,
           lastRunDate: config.lastRunDate,
           nextRunAt: data.nextRunAt || null,
-          running
+          running,
+          cacheUpdateEnabled: config.cacheUpdateEnabled
         });
       });
     });

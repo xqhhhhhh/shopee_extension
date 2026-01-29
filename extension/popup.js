@@ -17,6 +17,7 @@ const scheduleInfoEl = document.getElementById('scheduleInfo');
 const fixedListHintEl = document.getElementById('fixedListHint');
 const autoCategoryHintEl = document.getElementById('autoCategoryHint');
 const autoStatusEl = document.getElementById('autoStatus');
+const cacheUpdateEnabledEl = document.getElementById('cacheUpdateEnabled');
 const downloadHistoryCsvBtn = document.getElementById('downloadHistoryCsv');
 const viewCacheBtn = document.getElementById('viewCache');
 const downloadCacheBtn = document.getElementById('downloadCache');
@@ -55,6 +56,7 @@ const STORAGE_KEYS = {
   dailySnapshots: 'dailySnapshots',
   lastRunAt: 'lastRunAt',
   nextRunAt: 'nextRunAt',
+  cacheUpdateEnabled: 'cacheUpdateEnabled',
   cachedCategoryUrl: 'cachedCategoryUrl',
   cachedCategoryUrls: 'cachedCategoryUrls',
   cachedCategoryUpdatedAt: 'cachedCategoryUpdatedAt'
@@ -263,6 +265,12 @@ function getRecordOriginalPrice(record) {
     return Math.max(...record.price.originalRange.filter((value) => typeof value === 'number'));
   }
   return null;
+}
+
+function getRecordProductId(record) {
+  if (record?.productId) return record.productId;
+  if (record?.data?.productId) return record.data.productId;
+  return '';
 }
 
 function getRecordDiscountedPriceMax(record) {
@@ -650,12 +658,14 @@ importUrlsBtn.addEventListener('click', () => {
 saveScheduleBtn.addEventListener('click', () => {
   const scheduleTime = scheduleTimeEl.value || '02:00';
   const categoryUrl = AUTO_CATEGORY_URL;
+  const cacheUpdateEnabled = cacheUpdateEnabledEl ? Boolean(cacheUpdateEnabledEl.checked) : true;
   storageSet({
     [STORAGE_KEYS.scheduleTime]: scheduleTime,
-    categoryUrl
+    categoryUrl,
+    [STORAGE_KEYS.cacheUpdateEnabled]: cacheUpdateEnabled
   }).then(() => {
     chrome.runtime.sendMessage(
-      { type: 'config-update', scheduleTime, categoryUrl },
+      { type: 'config-update', scheduleTime, categoryUrl, cacheUpdateEnabled },
       (response) => {
         if (!response || !response.ok) {
           setAutoStatus('自动抓取配置保存失败');
@@ -673,8 +683,9 @@ saveScheduleBtn.addEventListener('click', () => {
 
 runDailyNowBtn.addEventListener('click', () => {
   const scheduleTime = scheduleTimeEl.value || '02:00';
+  const cacheUpdateEnabled = cacheUpdateEnabledEl ? Boolean(cacheUpdateEnabledEl.checked) : true;
   chrome.runtime.sendMessage(
-    { type: 'config-update', scheduleTime, categoryUrl: AUTO_CATEGORY_URL },
+    { type: 'config-update', scheduleTime, categoryUrl: AUTO_CATEGORY_URL, cacheUpdateEnabled },
     () => {
       chrome.runtime.sendMessage({ type: 'daily-run-now' }, () => {
         setAutoStatus('已触发自动抓取任务');
@@ -707,19 +718,25 @@ runFilterBtn.addEventListener('click', async () => {
 
   for (const [url, records] of grouped.entries()) {
     if (matchesRules(records, filterOptions)) {
-      filterUrls.push(url);
+      const sorted = records
+        .slice()
+        .sort((a, b) => (getRecordDateText(a) || '').localeCompare(getRecordDateText(b) || ''));
+      const latest = sorted[sorted.length - 1];
+      const productId = getRecordProductId(latest);
+      filterUrls.push({ url, productId });
     }
   }
 
   updateFilterDownloadButton();
   const lines = [`符合条件 ${filterUrls.length} 条`];
   lines.push('');
-  lines.push(...filterUrls);
+  lines.push(...filterUrls.map((item) => `${item.productId || ''}\t${item.url}`));
   setFilterOutput(lines.join('\n'));
 });
 
 downloadFilterBtn.addEventListener('click', () => {
-  downloadFile(filterUrls.join('\n'), `shopee_filter_${Date.now()}.txt`, 'text/plain');
+  const lines = filterUrls.map((item) => `${item.productId || ''}\t${item.url}`);
+  downloadFile(lines.join('\n'), `shopee_filter_${Date.now()}.txt`, 'text/plain');
 });
 
 downloadHistoryBtn.addEventListener('click', async () => {
@@ -914,6 +931,7 @@ async function restoreState() {
     STORAGE_KEYS.listMeta,
     STORAGE_KEYS.batchResults,
     STORAGE_KEYS.scheduleTime,
+    STORAGE_KEYS.cacheUpdateEnabled,
     STORAGE_KEYS.lastRunAt,
     STORAGE_KEYS.nextRunAt
   ]);
@@ -925,6 +943,10 @@ async function restoreState() {
   const savedSchedule = data[STORAGE_KEYS.scheduleTime];
   if (savedSchedule) {
     scheduleTimeEl.value = savedSchedule;
+  }
+  if (cacheUpdateEnabledEl) {
+    const savedCacheUpdate = data[STORAGE_KEYS.cacheUpdateEnabled];
+    cacheUpdateEnabledEl.checked = savedCacheUpdate !== false;
   }
   updateScheduleInfo({
     lastRunAt: data[STORAGE_KEYS.lastRunAt] || null,
@@ -965,6 +987,9 @@ async function restoreState() {
   chrome.runtime.sendMessage({ type: 'config-status' }, (status) => {
     if (!status) return;
     if (status.scheduleTime) scheduleTimeEl.value = status.scheduleTime;
+    if (cacheUpdateEnabledEl && typeof status.cacheUpdateEnabled === 'boolean') {
+      cacheUpdateEnabledEl.checked = status.cacheUpdateEnabled;
+    }
     updateScheduleInfo({ lastRunAt: status.lastRunAt, nextRunAt: status.nextRunAt });
   });
 }

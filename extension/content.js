@@ -159,6 +159,43 @@
     return matches;
   }
 
+  function randomBetween(min, max) {
+    const low = Math.min(min, max);
+    const high = Math.max(min, max);
+    return Math.floor(low + Math.random() * (high - low + 1));
+  }
+
+  async function randomScrollJitter(rounds = 2) {
+    const maxScrollTop = Math.max(0, document.body.scrollHeight - window.innerHeight);
+    if (maxScrollTop <= 0) return;
+    for (let i = 0; i < rounds; i += 1) {
+      const offset = randomBetween(120, 420);
+      const direction = Math.random() > 0.5 ? 1 : -1;
+      const target = Math.min(maxScrollTop, Math.max(0, window.scrollY + direction * offset));
+      window.scrollTo({ top: target, behavior: 'smooth' });
+      await sleep(randomBetween(500, 1200));
+    }
+  }
+
+  function startScrollJitterLoop() {
+    let running = true;
+    (async () => {
+      while (running) {
+        const maxScrollTop = Math.max(0, document.body.scrollHeight - window.innerHeight);
+        if (maxScrollTop > 0) {
+          const offset = randomBetween(160, 520);
+          const direction = Math.random() > 0.5 ? 1 : -1;
+          const target = Math.min(maxScrollTop, Math.max(0, window.scrollY + direction * offset));
+          window.scrollTo({ top: target, behavior: 'smooth' });
+        }
+        await sleep(randomBetween(800, 1600));
+      }
+    })();
+    return () => {
+      running = false;
+    };
+  }
+
   function extractCurrencyRange(text, symbol) {
     if (!text) return null;
     const re = new RegExp(
@@ -669,21 +706,28 @@
       };
     }
 
+    const stopScrollLoop = startScrollJitterLoop();
+
     let data = null;
     let stable = false;
-    for (let attempt = 1; attempt <= retryLimit; attempt += 1) {
-      const result = await waitForStableData(root, {
-        timeoutMs: retryWaitMs,
-        pollMs: 800,
-        stableRounds: 3,
-        idleMs: 1200
-      });
-      data = result.data;
-      stable = result.stable;
-      if (stable) break;
-      if (attempt < retryLimit) {
-        await sleep(300);
+    try {
+      let attempt = 1;
+      for (; attempt <= retryLimit; attempt += 1) {
+        const result = await waitForStableData(root, {
+          timeoutMs: retryWaitMs,
+          pollMs: 800,
+          stableRounds: 3,
+          idleMs: 1200
+        });
+        data = result.data;
+        stable = result.stable;
+        if (stable) break;
+        if (attempt < retryLimit) {
+          await sleep(300);
+        }
       }
+    } finally {
+      stopScrollLoop();
     }
 
     if (!stable && data) {
