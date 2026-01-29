@@ -73,6 +73,10 @@ body {
   display: flex;
 }
 
+.tab-panel[data-tab="manual"] {
+  display: none !important;
+}
+
 header h1 {
   margin: 0 0 4px;
   font-size: 18px;
