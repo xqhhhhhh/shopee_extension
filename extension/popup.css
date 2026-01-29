@@ -28,6 +28,51 @@ body {
   gap: 12px;
 }
 
+.tab-nav {
+  display: flex;
+  gap: 8px;
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 6px;
+  box-shadow: 0 8px 16px rgba(255, 106, 0, 0.08);
+}
+
+.tab-button {
+  flex: 1;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, transform 0.15s ease;
+}
+
+.tab-button:hover {
+  transform: translateY(-1px);
+  background: rgba(255, 106, 0, 0.12);
+  color: var(--text);
+}
+
+.tab-button.is-active {
+  background: var(--accent);
+  color: #fff;
+  box-shadow: 0 6px 12px rgba(255, 106, 0, 0.2);
+}
+
+.tab-panel {
+  display: none;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.tab-panel.is-active {
+  display: flex;
+}
+
 header h1 {
   margin: 0 0 4px;
   font-size: 18px;
@@ -72,6 +117,23 @@ header p {
 
 .option input {
   margin: 0;
+}
+
+.option--inline-input {
+  gap: 6px;
+}
+
+.option--inline-input input[type="number"] {
+  width: 60px;
+  padding: 2px 6px;
+  font-size: 11px;
+}
+
+.option-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin: 6px 0 4px;
 }
 
 label {
@@ -156,7 +218,7 @@ input[type="text"] {
   flex-wrap: wrap;
 }
 
-button {
+button:not(.tab-button) {
   flex: 1;
   border: none;
   border-radius: 8px;
@@ -169,12 +231,12 @@ button {
   transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.2s ease;
 }
 
-button:hover {
+button:not(.tab-button):hover {
   transform: translateY(-1px);
   box-shadow: 0 6px 12px rgba(255, 106, 0, 0.2);
 }
 
-button:disabled {
+button:not(.tab-button):disabled {
   background: #f3c4a0;
   cursor: not-allowed;
   box-shadow: none;

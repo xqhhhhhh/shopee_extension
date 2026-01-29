@@ -1,25 +1,37 @@
 const BATCH_TIMEOUT_MS = 45000;
-const MAX_CONCURRENCY = 10;
+const FIXED_BATCH_CONCURRENCY = 1;
 const DAILY_ALARM_NAME = 'daily-crawl';
 const DEFAULT_SCHEDULE_TIME = '02:00';
 const DEFAULT_CATEGORY_URL = '';
 const MAX_DAILY_DAYS = 120;
+const INCOMPLETE_RETRY_LIMIT = 2;
+const BATCH_REST_EVERY = 5;
+const BATCH_REST_MIN_MS = 10 * 1000;
+const BATCH_REST_MAX_MS = 60 * 1000;
+const CATEGORY_CACHE_TTL_HOURS = 24;
+const CATEGORY_CACHE_URL_KEY = 'cachedCategoryUrl';
+const CATEGORY_CACHE_KEY = 'cachedCategoryUrls';
+const CATEGORY_CACHE_UPDATED_AT_KEY = 'cachedCategoryUpdatedAt';
+const KEEP_AUTO_TABS_OPEN = true;
+const CATEGORY_COLLECT_TIMEOUT_MS = 30 * 60 * 1000;
+let categoryTabId = null;
+const INCOMPLETE_WARNINGS = [
+  '未找到卖家名称',
+  '未找到类目信息',
+  '未找到上架时间',
+  '未找到SKU表格或SKU行',
+  '字段仍在加载'
+];
 
 let queue = [];
 let results = [];
 let running = false;
 let paused = false;
-let concurrency = 3;
+let concurrency = FIXED_BATCH_CONCURRENCY;
 let pendingDailyRun = false;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function normalizeConcurrency(value) {
-  const parsed = Number.parseInt(value, 10);
-  if (Number.isNaN(parsed)) return 1;
-  return Math.min(MAX_CONCURRENCY, Math.max(1, parsed));
 }
 
 function storageGet(keys) {
@@ -49,6 +61,36 @@ function parseScheduleTime(timeText) {
   return { hours, minutes };
 }
 
+async function loadCategoryCache(categoryUrl) {
+  const data = await storageGet([
+    CATEGORY_CACHE_KEY,
+    CATEGORY_CACHE_UPDATED_AT_KEY,
+    CATEGORY_CACHE_URL_KEY,
+    'listUrls'
+  ]);
+  const urls = Array.isArray(data[CATEGORY_CACHE_KEY]) ? data[CATEGORY_CACHE_KEY] : [];
+  const cachedUrl = data[CATEGORY_CACHE_URL_KEY] || '';
+  const updatedAt = data[CATEGORY_CACHE_UPDATED_AT_KEY] || null;
+  const fallbackUrls = Array.isArray(data.listUrls) ? data.listUrls : [];
+  if (!categoryUrl || cachedUrl !== categoryUrl) {
+    return { urls: [], fallbackUrls, updatedAt: null, fresh: false };
+  }
+  if (!updatedAt) return { urls, updatedAt: null, fresh: false };
+  const updatedAtMs = new Date(updatedAt).getTime();
+  const ttlMs = CATEGORY_CACHE_TTL_HOURS * 60 * 60 * 1000;
+  const fresh = Number.isFinite(updatedAtMs) ? Date.now() - updatedAtMs < ttlMs : false;
+  return { urls, fallbackUrls, updatedAt, fresh };
+}
+
+async function saveCategoryCache(categoryUrl, urls) {
+  if (!categoryUrl) return;
+  await storageSet({
+    [CATEGORY_CACHE_URL_KEY]: categoryUrl,
+    [CATEGORY_CACHE_KEY]: urls,
+    [CATEGORY_CACHE_UPDATED_AT_KEY]: new Date().toISOString()
+  });
+}
+
 function nextRunAt(timeText) {
   const now = new Date();
   const { hours, minutes } = parseScheduleTime(timeText);
@@ -64,20 +106,18 @@ async function loadConfig() {
   const data = await storageGet([
     'scheduleTime',
     'categoryUrl',
-    'batchConcurrency',
     'lastRunDate',
     'lastRunAt'
   ]);
   const scheduleTime = data.scheduleTime || DEFAULT_SCHEDULE_TIME;
   const categoryUrl = data.categoryUrl || DEFAULT_CATEGORY_URL;
-  const storedConcurrency = normalizeConcurrency(data.batchConcurrency ?? concurrency);
-  concurrency = storedConcurrency;
+  concurrency = FIXED_BATCH_CONCURRENCY;
   return {
     scheduleTime,
     categoryUrl,
     lastRunDate: data.lastRunDate || null,
     lastRunAt: data.lastRunAt || null,
-    concurrency: storedConcurrency
+    concurrency
   };
 }
 
@@ -148,11 +188,11 @@ function waitForTabComplete(tabId, targetUrl) {
   });
 }
 
-function sendMessageToTab(tabId, message) {
+function sendMessageToTab(tabId, message, timeoutMs = BATCH_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       reject(new Error('内容脚本响应超时'));
-    }, BATCH_TIMEOUT_MS);
+    }, timeoutMs);
 
     chrome.tabs.sendMessage(tabId, message, (response) => {
       clearTimeout(timeout);
@@ -166,17 +206,123 @@ function sendMessageToTab(tabId, message) {
   });
 }
 
+function randomBetween(min, max) {
+  const low = Math.min(min, max);
+  const high = Math.max(min, max);
+  return Math.floor(low + Math.random() * (high - low + 1));
+}
+
+function buildUrlPattern(url) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}*`;
+  } catch (error) {
+    return null;
+  }
+}
+
+function normalizeCategoryUrlForCache(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.searchParams.has('page')) {
+      parsed.searchParams.set('page', '0');
+    }
+    return parsed.href;
+  } catch (error) {
+    return url || '';
+  }
+}
+
+async function updateCategoryCache(categoryUrl, urls) {
+  if (!categoryUrl || !Array.isArray(urls) || !urls.length) return;
+  const data = await storageGet([CATEGORY_CACHE_KEY]);
+  const existing = Array.isArray(data[CATEGORY_CACHE_KEY]) ? data[CATEGORY_CACHE_KEY] : [];
+  const merged = Array.from(new Set([...existing, ...urls]));
+  await saveCategoryCache(categoryUrl, merged);
+}
+
+async function ensureCategoryTab(categoryUrl) {
+  if (categoryTabId) {
+    try {
+      const existing = await chrome.tabs.get(categoryTabId);
+      if (existing && existing.id) {
+        await chrome.tabs.update(existing.id, { url: categoryUrl, active: true });
+        return existing;
+      }
+    } catch (error) {
+      categoryTabId = null;
+    }
+  }
+
+  const pattern = buildUrlPattern(categoryUrl);
+  if (pattern) {
+    const tabs = await chrome.tabs.query({ url: [pattern] });
+    const tab = tabs.find((item) => item && item.id);
+    if (tab && tab.id) {
+      categoryTabId = tab.id;
+      await chrome.tabs.update(tab.id, { url: categoryUrl, active: true });
+      return tab;
+    }
+  }
+
+  const created = await chrome.tabs.create({ url: categoryUrl, active: true });
+  categoryTabId = created.id || null;
+  return created;
+}
+
+function safeCloseTab(tabId) {
+  return new Promise((resolve) => {
+    if (KEEP_AUTO_TABS_OPEN) {
+      chrome.tabs.update(tabId, { url: 'about:blank' }, () => resolve());
+      return;
+    }
+    chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError || !tab) {
+        resolve();
+        return;
+      }
+      chrome.tabs.query({ windowId: tab.windowId }, (tabs) => {
+        if (chrome.runtime.lastError) {
+          resolve();
+          return;
+        }
+        const count = Array.isArray(tabs) ? tabs.length : 0;
+        if (count <= 1) {
+          chrome.tabs.update(tabId, { url: 'about:blank', active: true }, () => resolve());
+          return;
+        }
+        chrome.tabs.remove(tabId, () => resolve());
+      });
+    });
+  });
+}
+
+function isIncompleteResult(result) {
+  if (!result || !result.success || !result.data) return false;
+  const data = result.data;
+  const warnings = Array.isArray(data.warnings) ? data.warnings : [];
+  const hasMissingWarning = warnings.some((warning) => INCOMPLETE_WARNINGS.some((key) => warning.includes(key)));
+  const missingCoreFields =
+    !data.sellerName ||
+    !data.category ||
+    !data.listedDate ||
+    !Array.isArray(data.sku) ||
+    data.sku.length === 0;
+  return hasMissingWarning || missingCoreFields;
+}
+
 async function extractFromUrl(url, existingTabId) {
   let tabId = existingTabId;
   try {
     if (!tabId) {
-      const tab = await chrome.tabs.create({ url, active: false });
+      const tab = await chrome.tabs.create({ url, active: true });
       tabId = tab.id;
     } else {
-      await chrome.tabs.update(tabId, { url, active: false });
+      await chrome.tabs.update(tabId, { url, active: true });
     }
     await waitForTabComplete(tabId, url);
-    const response = await sendMessageToTab(tabId, { type: 'extract' });
+    await sleep(1200);
+    const response = await sendMessageToTab(tabId, { type: 'extract' }, BATCH_TIMEOUT_MS);
     return { result: response || { success: false, error: '无响应' }, tabId };
   } catch (error) {
     return { result: { success: false, error: error.message || '未知错误' }, tabId };
@@ -184,38 +330,28 @@ async function extractFromUrl(url, existingTabId) {
 }
 
 async function collectCategoryUrls(categoryUrl) {
-  const tab = await chrome.tabs.create({ url: categoryUrl, active: false });
+  const tab = await ensureCategoryTab(categoryUrl);
   try {
     await waitForTabComplete(tab.id, categoryUrl);
+    await sleep(1200);
     const response = await sendMessageToTab(tab.id, {
       type: 'collect-product-urls',
       paginate: true,
       maxPages: 50
-    });
+    }, CATEGORY_COLLECT_TIMEOUT_MS);
     return response || { success: false, error: '无响应' };
   } catch (error) {
     return { success: false, error: error.message || '未知错误' };
-  } finally {
-    chrome.tabs.remove(tab.id);
   }
 }
 
 function buildDailyRecord(data, dateStr) {
-  const skus = Array.isArray(data?.sku)
-    ? data.sku.map((sku) => ({
-      name: sku?.name || '',
-      stock: sku?.stock ?? null
-    }))
-    : [];
+  if (!data) return null;
+  const capturedAt = data.extractedAt || new Date().toISOString();
   return {
+    ...data,
     date: dateStr,
-    capturedAt: new Date().toISOString(),
-    url: data?.url || '',
-    productId: data?.productId || null,
-    listedDate: data?.listedDate || null,
-    originalPrice: data?.price?.original ?? null,
-    last30Qty: data?.sales?.last30Qty ?? null,
-    skus
+    capturedAt
   };
 }
 
@@ -256,6 +392,9 @@ async function processQueue({ emitEvents = true, recordResults = true, allowPaus
   const total = queue.length;
   let index = 0;
   const workerCount = Math.max(1, Math.min(concurrency, total || 1));
+  const retryCounts = new Map();
+  const latestResults = new Map();
+  let processedCount = 0;
 
   async function runWorker() {
     let tabId = null;
@@ -269,6 +408,7 @@ async function processQueue({ emitEvents = true, recordResults = true, allowPaus
         const url = queue.shift();
         if (!url) continue;
         index += 1;
+        processedCount += 1;
         const { result, tabId: nextTabId } = await extractFromUrl(url, tabId);
         tabId = nextTabId;
         const payload = {
@@ -278,7 +418,8 @@ async function processQueue({ emitEvents = true, recordResults = true, allowPaus
           result
         };
         if (recordResults) {
-          results.push(payload);
+          latestResults.set(url, payload);
+          results = Array.from(latestResults.values());
           saveBatchState({ saveResults: true });
         }
         if (emitEvents) {
@@ -287,10 +428,23 @@ async function processQueue({ emitEvents = true, recordResults = true, allowPaus
         if (typeof onItem === 'function') {
           onItem(payload);
         }
+
+        if (isIncompleteResult(result)) {
+          const currentRetries = retryCounts.get(url) || 0;
+          if (currentRetries < INCOMPLETE_RETRY_LIMIT) {
+            retryCounts.set(url, currentRetries + 1);
+            queue.push(url);
+          }
+        }
+
+        if (processedCount % BATCH_REST_EVERY === 0) {
+          const restMs = randomBetween(BATCH_REST_MIN_MS, BATCH_REST_MAX_MS);
+          await sleep(restMs);
+        }
       }
     } finally {
       if (tabId != null) {
-        chrome.tabs.remove(tabId);
+        await safeCloseTab(tabId);
       }
     }
   }
@@ -321,29 +475,58 @@ async function runDailyJob(source) {
     return;
   }
 
-  const listResult = await collectCategoryUrls(config.categoryUrl);
-  if (!listResult || !listResult.success || !Array.isArray(listResult.urls) || !listResult.urls.length) {
+  const cache = await loadCategoryCache(config.categoryUrl);
+  const forceRefresh = source === 'manual';
+  let cachedUrls = cache.urls.slice();
+  let listResult = null;
+
+  if (!cachedUrls.length && cache.fallbackUrls && cache.fallbackUrls.length) {
+    cachedUrls = cache.fallbackUrls.slice();
+    await saveCategoryCache(config.categoryUrl, cachedUrls);
+  }
+
+  if (forceRefresh || !cache.fresh || !cachedUrls.length) {
+    listResult = await collectCategoryUrls(config.categoryUrl);
+    if (listResult?.success && Array.isArray(listResult.urls) && listResult.urls.length) {
+      const merged = new Set([...cachedUrls, ...listResult.urls]);
+      cachedUrls = Array.from(merged);
+      await saveCategoryCache(config.categoryUrl, cachedUrls);
+    }
+  }
+
+  if (!cachedUrls.length) {
+    const refreshed = await loadCategoryCache(config.categoryUrl);
+    cachedUrls = refreshed.urls.slice();
+  }
+
+  if (!cachedUrls.length) {
     return;
   }
 
-  queue = listResult.urls.slice();
+  queue = cachedUrls.slice();
   paused = false;
-  concurrency = normalizeConcurrency(config.concurrency);
+  concurrency = FIXED_BATCH_CONCURRENCY;
 
   const dateStr = toYmd(new Date());
-  const dailyRecords = [];
+  const dailyRecordMap = new Map();
+  let saveChain = Promise.resolve();
   await processQueue({
-    emitEvents: false,
-    recordResults: false,
+    emitEvents: source === 'manual',
+    recordResults: true,
     allowPause: false,
     onItem: (payload) => {
       if (payload?.result?.success && payload.result.data) {
-        dailyRecords.push(buildDailyRecord(payload.result.data, dateStr));
+        const record = buildDailyRecord(payload.result.data, dateStr);
+        if (record) {
+          dailyRecordMap.set(record.url, record);
+          saveChain = saveChain.then(() => saveDailySnapshots([record]));
+        }
       }
     }
   });
 
-  await saveDailySnapshots(dailyRecords);
+  await saveChain;
+  await saveDailySnapshots(Array.from(dailyRecordMap.values()));
   const now = new Date();
   await storageSet({
     lastRunDate: toYmd(now),
@@ -389,13 +572,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ started: false, error: 'URL列表为空' });
       return;
     }
-    if (message.concurrency != null) {
-      concurrency = normalizeConcurrency(message.concurrency);
-    }
+    concurrency = FIXED_BATCH_CONCURRENCY;
     paused = false;
     saveBatchState({ saveResults: true });
     processQueue({ emitEvents: true, recordResults: true, allowPause: true });
     sendResponse({ started: true });
+    return true;
+  }
+
+  if (message.type === 'collect-product-urls-progress') {
+    const payload = message.payload || {};
+    const categoryUrl = normalizeCategoryUrlForCache(payload.categoryUrl || '');
+    const urls = Array.isArray(payload.urls) ? payload.urls : [];
+    updateCategoryCache(categoryUrl, urls).then(() => {
+      sendResponse({ ok: true });
+    });
     return true;
   }
 

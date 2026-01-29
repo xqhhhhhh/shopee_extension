@@ -13,72 +13,113 @@
         <p>从Shopee商品页的Shopdora插件模块提取数据</p>
       </header>
 
-      <section class="panel">
-        <label for="urlFile">批量URL文件（每行一个）</label>
-        <div class="file-row">
-          <input id="urlFile" type="file" accept=".txt" />
-          <button id="importUrls" type="button">导入文件</button>
-        </div>
-        <div class="config-row">
-          <label for="concurrency" class="inline-label">并发Tab</label>
-          <input id="concurrency" type="number" min="1" max="10" step="1" value="3" />
-        </div>
-        <div class="buttons">
-          <button id="extractCurrent">提取当前页</button>
-          <button id="extractBatch">批量提取</button>
-          <button id="pauseBatch" disabled>暂停</button>
-        </div>
-      </section>
+      <nav class="tab-nav">
+        <button class="tab-button is-active" data-tab="auto" type="button">自动</button>
+        <button class="tab-button" data-tab="manual" type="button">手动</button>
+      </nav>
 
-      <section class="panel">
-        <div class="panel-header">
-          <h2>自动抓取设置</h2>
-        </div>
-        <label for="categoryUrl">分类页URL</label>
-        <input id="categoryUrl" type="text" placeholder="https://shopee.ph/..." />
-        <div class="config-row">
-          <label for="scheduleTime" class="inline-label">每日时间</label>
-          <input id="scheduleTime" type="time" value="02:00" />
-          <button id="saveSchedule" type="button">保存</button>
-          <button id="runDailyNow" type="button">立即运行</button>
-        </div>
-        <p id="scheduleInfo" class="hint">尚未设置自动抓取</p>
-      </section>
-      
-      <section class="panel">
-        <div class="buttons">
-          <button id="downloadJson" disabled>下载JSON</button>
-          <button id="downloadCsv" disabled>下载CSV</button>
-        </div>
-        <pre id="output" class="output">等待提取...</pre>
-      </section>
+      <div class="tab-panel is-active" data-tab="auto">
+        <section class="panel">
+          <div class="panel-header">
+            <h2>自动抓取设置</h2>
+          </div>
+          <div class="config-row">
+            <label for="scheduleTime" class="inline-label">每日时间</label>
+            <input id="scheduleTime" type="time" value="02:00" />
+            <button id="saveSchedule" type="button">保存</button>
+            <button id="runDailyNow" type="button">立即运行</button>
+          </div>
+          <p id="autoCategoryHint" class="hint"></p>
+          <p id="scheduleInfo" class="hint">尚未设置自动抓取</p>
+          <p id="autoStatus" class="hint"></p>
+        </section>
 
-      <section class="panel">
-        <div class="panel-header">
-          <h2>筛选结果</h2>
-        </div>
-        <div class="buttons">
-          <button id="runFilter">运行筛选</button>
-          <button id="downloadFilter" disabled>下载筛选URL</button>
-          <button id="downloadHistory">下载历史JSONL</button>
-        </div>
-        <pre id="filterOutput" class="output output--compact">等待筛选...</pre>
-      </section>
+        <section class="panel">
+          <div class="panel-header">
+            <h2>数据库导出</h2>
+          </div>
+          <div class="buttons">
+            <button id="downloadHistory">下载数据库JSONL</button>
+            <button id="downloadHistoryCsv">下载数据库CSV</button>
+            <button id="viewCache">查看缓存</button>
+            <button id="downloadCache">下载缓存URL</button>
+          </div>
+        </section>
 
-      <section class="panel">
-        <div class="panel-header">
-          <h2>分类页商品链接</h2>
-          <label class="option">
-            <input type="checkbox" id="autoPaginate" checked />
-            自动翻页
-          </label>
-        </div>
-        <div class="buttons">
-          <button id="extractList">抓取当前分类页链接</button>
-          <button id="downloadUrls" disabled>下载URL</button>
-        </div>
-        <pre id="listOutput" class="output output--compact">等待抓取...</pre>
-      </section>
+        <section class="panel">
+          <div class="panel-header">
+            <h2>筛选结果</h2>
+          </div>
+          <div class="option-group">
+            <label class="option">
+              <input type="checkbox" id="filterLast30Qty" checked />
+              近30日销量 &gt; 200
+            </label>
+            <label class="option">
+              <input type="checkbox" id="filterDiscountedPrice" checked />
+              折后价格区间最大值 &gt; 150
+            </label>
+            <label class="option">
+              <input type="checkbox" id="filterListedDate" checked />
+              上架时间 &le; 500天
+            </label>
+            <label class="option">
+              <input type="checkbox" id="filterSkuDrop" checked />
+              SKU库存连续5天至少下降10
+            </label>
+            <label class="option option--inline-input">
+              <input type="checkbox" id="filterSkuAvgDrop" />
+              SKU平均日降 ≥ 10（近
+              <input type="number" id="filterSkuAvgWindow" min="3" max="60" step="1" value="7" />
+              个有效值）
+            </label>
+          </div>
+          <div class="buttons">
+            <button id="runFilter">运行筛选</button>
+            <button id="downloadFilter" disabled>下载筛选URL</button>
+          </div>
+          <pre id="filterOutput" class="output output--compact">等待筛选...</pre>
+        </section>
+      </div>
+
+      <div class="tab-panel" data-tab="manual">
+        <section class="panel">
+          <label for="urlFile">批量URL文件（每行一个）</label>
+          <div class="file-row">
+            <input id="urlFile" type="file" accept=".txt" />
+            <button id="importUrls" type="button">导入文件</button>
+          </div>
+          <div class="buttons">
+            <button id="extractCurrent">提取当前页</button>
+            <button id="extractBatch">批量提取</button>
+            <button id="pauseBatch" disabled>暂停</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="buttons">
+            <button id="downloadJson" disabled>下载JSONL</button>
+            <button id="downloadCsv" disabled>下载CSV</button>
+          </div>
+          <pre id="output" class="output">等待提取...</pre>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>分类页商品链接</h2>
+            <label class="option">
+              <input type="checkbox" id="autoPaginate" checked />
+              自动翻页
+            </label>
+          </div>
+          <div class="buttons">
+            <button id="extractList">抓取分类页链接</button>
+            <button id="downloadUrls" disabled>下载URL</button>
+          </div>
+          <p id="fixedListHint" class="hint"></p>
+          <pre id="listOutput" class="output output--compact">等待抓取...</pre>
+        </section>
+      </div>
 
 
     </div>

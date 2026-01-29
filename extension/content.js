@@ -159,6 +159,20 @@
     return matches;
   }
 
+  function extractCurrencyRange(text, symbol) {
+    if (!text) return null;
+    const re = new RegExp(
+      `${symbol}\\s*([\\d,.]+)\\s*(?:-|~|～|—|–|至|to)\\s*${symbol}?\\s*([\\d,.]+)`,
+      'i'
+    );
+    const match = text.match(re);
+    if (!match) return null;
+    const first = normalizeNumber(match[1]);
+    const second = normalizeNumber(match[2]);
+    if (first == null || second == null) return null;
+    return first <= second ? { min: first, max: second } : { min: second, max: first };
+  }
+
   function extractLabelValue(lines, labelPatterns) {
     for (const line of lines) {
       for (const pattern of labelPatterns) {
@@ -296,15 +310,18 @@
 
   function extractModulePrice(root) {
     const result = {
-      currentPHP: null,
-      currentCNY: null,
-      original: null,
+      currentPHPRange: null,
+      currentCNYRange: null,
+      originalRange: null,
       discount: null
     };
 
     const cnyEl = root.querySelector('.shopdoraPirceList') || document.querySelector('.shopdoraPirceList');
     if (cnyEl) {
-      result.currentCNY = extractCurrency(cnyEl.textContent || '', '¥');
+      const cnyValue = extractCurrency(cnyEl.textContent || '', '¥');
+      if (cnyValue != null) {
+        result.currentCNYRange = [cnyValue];
+      }
     }
 
     let priceText = '';
@@ -321,10 +338,28 @@
       const originalEl = priceBlock.querySelector('.ZA5sW5');
       const discountEl = priceBlock.querySelector('.vms4_3');
       if (currentEl) {
-        result.currentPHP = extractCurrency(currentEl.textContent || '', '₱');
+        const currentText = currentEl.textContent || '';
+        const range = extractCurrencyRange(currentText, '₱');
+        if (range) {
+          result.currentPHPRange = [range.min, range.max];
+        } else {
+          const value = extractCurrency(currentText, '₱');
+          if (value != null) {
+            result.currentPHPRange = [value];
+          }
+        }
       }
       if (originalEl) {
-        result.original = extractCurrency(originalEl.textContent || '', '₱');
+        const originalText = originalEl.textContent || '';
+        const range = extractCurrencyRange(originalText, '₱');
+        if (range) {
+          result.originalRange = [range.min, range.max];
+        } else {
+          const value = extractCurrency(originalText, '₱');
+          if (value != null) {
+            result.originalRange = [value];
+          }
+        }
       }
       if (discountEl) {
         const discountMatch = (discountEl.textContent || '').match(/-?\d+(?:\.\d+)?%/);
@@ -348,10 +383,26 @@
 
     if (priceText) {
       const text = priceText;
+      const phpRange = extractCurrencyRange(text, '₱');
+      if (phpRange) {
+        result.currentPHPRange = [phpRange.min, phpRange.max];
+      }
+      const cnyRange = extractCurrencyRange(text, '¥');
+      if (cnyRange) {
+        result.currentCNYRange = [cnyRange.min, cnyRange.max];
+      }
       const phpValues = extractAllCurrency(text, '₱');
       if (phpValues.length) {
-        result.currentPHP = phpValues[0] ?? null;
-        result.original = phpValues[1] ?? null;
+        if (!result.currentPHPRange) {
+          result.currentPHPRange = [phpValues[0] ?? null].filter((value) => value != null);
+        }
+        if (!result.originalRange) {
+          if (phpRange && phpValues.length >= 4) {
+            result.originalRange = [phpValues[2], phpValues[3]].filter((value) => value != null);
+          } else if (!phpRange && phpValues.length >= 2) {
+            result.originalRange = [phpValues[1]].filter((value) => value != null);
+          }
+        }
       }
       const discountMatch = text.match(/-?\\d+(?:\\.\\d+)?%/);
       if (discountMatch) {
@@ -407,9 +458,9 @@
     const listedDate = listedMatch ? listedMatch[1] : null;
 
     const modulePrice = extractModulePrice(root);
-    let currentPricePHP = modulePrice.currentPHP;
-    let currentPriceCNY = modulePrice.currentCNY;
-    const originalPrice = modulePrice.original;
+    let currentPricePHPRange = modulePrice.currentPHPRange;
+    let currentPriceCNYRange = modulePrice.currentCNYRange;
+    const originalPriceRange = modulePrice.originalRange;
     const discount = modulePrice.discount;
 
     const totalSalesText = getItemValueByTitle(root, /总销量|Total Sold|Total Sales/i) || '';
@@ -435,8 +486,13 @@
     const skuTableRows = parseSkuTables(root);
     const skuFromText = skuTableRows.length ? [] : parseSkuFromText(lines);
     const skus = skuTableRows.length ? skuTableRows : skuFromText;
-    if (!currentPriceCNY && skus.length && skus[0].price != null) {
-      currentPriceCNY = skus[0].price;
+    const skuPrices = skus.map((row) => row?.price).filter((value) => typeof value === 'number');
+    if (skuPrices.length) {
+      const minSkuPrice = Math.min(...skuPrices);
+      const maxSkuPrice = Math.max(...skuPrices);
+      if (!currentPriceCNYRange) {
+        currentPriceCNYRange = maxSkuPrice > minSkuPrice ? [minSkuPrice, maxSkuPrice] : [minSkuPrice];
+      }
     }
 
     if (!productId) warnings.push('未能从URL解析商品ID');
@@ -451,9 +507,9 @@
       sellerName,
       category,
       price: {
-        currentPHP: currentPricePHP,
-        currentCNY: currentPriceCNY,
-        original: originalPrice,
+        currentPHPRange: currentPricePHPRange,
+        currentCNYRange: currentPriceCNYRange,
+        originalRange: originalPriceRange,
         discount
       },
       listedDate,
@@ -498,9 +554,9 @@
       data.sellerName ?? '',
       data.category ?? '',
       data.listedDate ?? '',
-      price.currentPHP ?? '',
-      price.currentCNY ?? '',
-      price.original ?? '',
+      JSON.stringify(price.currentPHPRange ?? ''),
+      JSON.stringify(price.currentCNYRange ?? ''),
+      JSON.stringify(price.originalRange ?? ''),
       price.discount ?? '',
       sales.totalQty ?? '',
       sales.last30Qty ?? '',
@@ -642,13 +698,42 @@
   const LIST_LINK_SELECTOR = '.contents';
   const NEXT_PAGE_SELECTOR = '.shopee-icon-button.shopee-icon-button--right';
   const MAX_LIST_PAGES = 50;
-  const SCROLL_IDLE_ROUNDS = 3;
-  const SCROLL_STEP_MS = 800;
+  const LIST_POLL_INTERVAL_MS = 1000;
+  const LIST_SCROLL_IDLE_ROUNDS = 5;
+  const LIST_SCROLL_STEP_MS = 1600;
+  const LIST_SCROLL_SETTLE_MS = 1300;
+  const LIST_PAGE_DWELL_MS = 1500;
+  const LIST_PAGE_STABLE_ROUNDS = 3;
+  const LIST_PAGE_STABLE_INTERVAL_MS = 900;
+  const LIST_SCROLL_STEP_RATIO = 0.85;
+  const LIST_IDLE_STABLE_MS = 1600;
+  const LIST_IDLE_POLL_MS = 400;
+  const LIST_IDLE_TIMEOUT_MS = 16000;
+  const LIST_PAGE_RETRY_LIMIT = 3;
+  const LIST_PAGE_RETRY_WAIT_MS = 1800;
+  const LIST_PAGE_EXTRACT_ROUNDS = 3;
+  const LIST_PAGE_EXTRACT_INTERVAL_MS = 700;
+  const LIST_PAGE_CHANGE_RETRY_LIMIT = 2;
+  const LIST_PAGE_CHANGE_RETRY_WAIT_MS = 1200;
+  const LIST_NEXT_BUTTON_WAIT_MS = 15000;
+  const LIST_NEXT_BUTTON_POLL_MS = 500;
 
   function normalizeUrl(href) {
     if (!href) return null;
     try {
       return new URL(href, location.origin).href;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function normalizeCategoryUrlForCache(href) {
+    try {
+      const url = new URL(href, location.origin);
+      if (url.searchParams.has('page')) {
+        url.searchParams.set('page', '0');
+      }
+      return url.href;
     } catch (error) {
       return null;
     }
@@ -676,12 +761,54 @@
     return urls;
   }
 
-  async function waitForListItems(timeoutMs = MAX_WAIT_MS) {
+  function getListCount() {
+    return document.querySelectorAll(LIST_ITEM_SELECTOR).length;
+  }
+
+  async function waitForListIdle(
+    stableMs = LIST_IDLE_STABLE_MS,
+    timeoutMs = LIST_IDLE_TIMEOUT_MS,
+    pollMs = LIST_IDLE_POLL_MS
+  ) {
+    const start = Date.now();
+    let lastCount = getListCount();
+    let stableFor = 0;
+
+    while (Date.now() - start < timeoutMs) {
+      await sleep(pollMs);
+      const count = getListCount();
+      if (count > 0 && count === lastCount) {
+        stableFor += pollMs;
+        if (stableFor >= stableMs) return true;
+      } else {
+        lastCount = count;
+        stableFor = 0;
+      }
+    }
+    return false;
+  }
+
+  async function extractListUrlsWithRounds(
+    rounds = LIST_PAGE_EXTRACT_ROUNDS,
+    intervalMs = LIST_PAGE_EXTRACT_INTERVAL_MS
+  ) {
+    const merged = new Set();
+    for (let i = 0; i < rounds; i += 1) {
+      if (i > 0) {
+        await sleep(intervalMs);
+      }
+      const urls = extractListUrlsFromPage();
+      urls.forEach((url) => merged.add(url));
+    }
+    return Array.from(merged);
+  }
+
+  async function waitForListItems(timeoutMs = MAX_WAIT_MS, pollMs = LIST_POLL_INTERVAL_MS) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       const items = document.querySelectorAll(LIST_ITEM_SELECTOR);
       if (items.length) return Array.from(items);
-      await sleep(POLL_INTERVAL_MS);
+      await sleep(pollMs);
     }
     return null;
   }
@@ -690,11 +817,15 @@
     let idleRounds = 0;
     let lastCount = 0;
     const start = Date.now();
+    const stepPx = Math.max(320, Math.floor(window.innerHeight * LIST_SCROLL_STEP_RATIO));
 
     while (Date.now() - start < MAX_WAIT_MS) {
-      const items = document.querySelectorAll(LIST_ITEM_SELECTOR);
-      const count = items.length;
+      const maxScrollTop = Math.max(0, document.body.scrollHeight - window.innerHeight);
+      const nextTop = Math.min(maxScrollTop, window.scrollY + stepPx);
+      window.scrollTo({ top: nextTop, behavior: 'smooth' });
+      await sleep(LIST_SCROLL_STEP_MS);
 
+      const count = getListCount();
       if (count > lastCount) {
         lastCount = count;
         idleRounds = 0;
@@ -702,14 +833,14 @@
         idleRounds += 1;
       }
 
-      if (idleRounds >= SCROLL_IDLE_ROUNDS) {
+      const atBottom = window.scrollY + window.innerHeight >= document.body.scrollHeight - 2;
+      if (idleRounds >= LIST_SCROLL_IDLE_ROUNDS && atBottom) {
         break;
       }
-
-      window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
-      await sleep(SCROLL_STEP_MS);
     }
 
+    await waitForListIdle();
+    await sleep(LIST_SCROLL_SETTLE_MS);
     window.scrollTo({ top: 0, behavior: 'instant' });
     await sleep(200);
   }
@@ -730,12 +861,91 @@
     return urls.slice(0, 5).join('|');
   }
 
-  async function waitForPageChange(prevSignature) {
+  function getPageParam() {
+    try {
+      const url = new URL(location.href);
+      return url.searchParams.get('page');
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async function waitForPageChange(prevSignature, prevPage, pollMs = LIST_POLL_INTERVAL_MS) {
     const start = Date.now();
     while (Date.now() - start < MAX_WAIT_MS) {
       const signature = getPageSignature();
-      if (signature && signature !== prevSignature) return signature;
-      await sleep(POLL_INTERVAL_MS);
+      const currentPage = getPageParam();
+      if (signature && signature !== prevSignature) {
+        return { signature, page: currentPage, pageChanged: prevPage != null && currentPage != null && currentPage !== prevPage };
+      }
+      if (prevPage != null && currentPage != null && currentPage !== prevPage) {
+        return { signature, page: currentPage, pageChanged: true };
+      }
+      await sleep(pollMs);
+    }
+    return null;
+  }
+
+  async function waitForListStable(
+    prevSignature,
+    prevCount,
+    { timeoutMs = MAX_WAIT_MS, forceChange = false } = {}
+  ) {
+    const start = Date.now();
+    let lastCount = 0;
+    let stableRounds = 0;
+    let changed = forceChange;
+
+    while (Date.now() - start < timeoutMs) {
+      const items = document.querySelectorAll(LIST_ITEM_SELECTOR);
+      const count = items.length;
+      const signature = count ? getPageSignature() : '';
+
+      if (count === lastCount && count > 0) {
+        stableRounds += 1;
+      } else {
+        stableRounds = 0;
+      }
+
+      if (signature && signature !== prevSignature) {
+        changed = true;
+      }
+      if (prevCount != null && count > 0 && count !== prevCount) {
+        changed = true;
+      }
+
+      if (changed && stableRounds >= LIST_PAGE_STABLE_ROUNDS) {
+        return { signature, count };
+      }
+
+      lastCount = count;
+      await sleep(LIST_PAGE_STABLE_INTERVAL_MS);
+    }
+
+    return null;
+  }
+
+  async function clickNextPageWithRetry(nextButton, prevSignature, prevPage) {
+    for (let attempt = 1; attempt <= LIST_PAGE_CHANGE_RETRY_LIMIT; attempt += 1) {
+      nextButton.scrollIntoView({ block: 'center' });
+      nextButton.click();
+      const changed = await waitForPageChange(prevSignature, prevPage);
+      if (changed) return changed;
+      if (attempt < LIST_PAGE_CHANGE_RETRY_LIMIT) {
+        await sleep(LIST_PAGE_CHANGE_RETRY_WAIT_MS);
+      }
+    }
+    return null;
+  }
+
+  async function waitForNextButtonReady(timeoutMs = LIST_NEXT_BUTTON_WAIT_MS) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const nextButton = document.querySelector(NEXT_PAGE_SELECTOR);
+      if (nextButton && !isNextPageDisabled(nextButton)) {
+        return nextButton;
+      }
+      await sleep(LIST_NEXT_BUTTON_POLL_MS);
     }
     return null;
   }
@@ -756,12 +966,48 @@
 
     while (true) {
       pages += 1;
+      await sleep(LIST_PAGE_DWELL_MS);
       await autoScrollToLoadAllItems();
-      const pageUrls = extractListUrlsFromPage();
+      await sleep(LIST_PAGE_DWELL_MS);
+
+      let pageUrls = [];
+      let contentCount = 0;
+      for (let attempt = 1; attempt <= LIST_PAGE_RETRY_LIMIT; attempt += 1) {
+        contentCount = getListCount();
+        await waitForListIdle();
+        pageUrls = await extractListUrlsWithRounds();
+        if (contentCount > 0 && pageUrls.length >= contentCount) {
+          break;
+        }
+        if (attempt < LIST_PAGE_RETRY_LIMIT) {
+          await sleep(LIST_PAGE_RETRY_WAIT_MS);
+          await waitForListIdle();
+        }
+      }
+
       if (!pageUrls.length) {
         warnings.push(`第${pages}页未解析到商品链接`);
       } else {
         pageUrls.forEach((url) => urls.add(url));
+      }
+
+      if (pageUrls.length) {
+        try {
+          chrome.runtime.sendMessage({
+            type: 'collect-product-urls-progress',
+            payload: {
+              categoryUrl: normalizeCategoryUrlForCache(location.href),
+              page: pages,
+              urls: pageUrls
+            }
+          });
+        } catch (error) {
+          // ignore
+        }
+      }
+
+      if (contentCount > 0 && pageUrls.length !== contentCount) {
+        warnings.push(`第${pages}页数量校准: 列表${contentCount}项，解析${pageUrls.length}条`);
       }
 
       if (!paginate) break;
@@ -770,38 +1016,58 @@
         break;
       }
 
-      const nextButton = document.querySelector(NEXT_PAGE_SELECTOR);
-      if (!nextButton) {
-        warnings.push('未找到下一页按钮');
-        break;
-      }
-      if (isNextPageDisabled(nextButton)) {
-        break;
+      let advanced = false;
+      while (true) {
+        const nextButton = await waitForNextButtonReady();
+        if (!nextButton) {
+          warnings.push('未找到可用下一页按钮');
+          break;
+        }
+
+        const signature = getPageSignature();
+        const prevCount = getListCount();
+        const prevPage = getPageParam();
+        const changed = await clickNextPageWithRetry(nextButton, signature, prevPage);
+        if (changed) {
+          const stable = await waitForListStable(signature, prevCount, { forceChange: changed.pageChanged });
+          if (stable) {
+            advanced = true;
+            break;
+          }
+          warnings.push('翻页后商品列表未稳定加载完成，继续重试');
+        } else {
+          warnings.push('翻页后页面内容未更新，继续重试');
+        }
+
+        await sleep(LIST_PAGE_CHANGE_RETRY_WAIT_MS * 2);
       }
 
-      const signature = getPageSignature();
-      nextButton.scrollIntoView({ block: 'center' });
-      nextButton.click();
-
-      const changed = await waitForPageChange(signature);
-      if (!changed) {
-        warnings.push('翻页后页面内容未更新');
-        break;
-      }
-
-      const items = await waitForListItems();
-      if (!items) {
-        warnings.push('翻页后商品列表加载失败');
+      if (!advanced) {
         break;
       }
     }
 
-    return {
+    const result = {
       success: true,
       urls: Array.from(urls),
       pages,
       warnings
     };
+    try {
+      chrome.runtime.sendMessage({
+        type: 'collect-product-urls-progress',
+        payload: {
+          categoryUrl: normalizeCategoryUrlForCache(location.href),
+          page: pages,
+          urls: result.urls,
+          done: true,
+          total: result.urls.length
+        }
+      });
+    } catch (error) {
+      // ignore
+    }
+    return result;
   }
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

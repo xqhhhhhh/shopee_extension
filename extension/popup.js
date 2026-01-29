@@ -2,7 +2,6 @@ const outputEl = document.getElementById('output');
 const listOutputEl = document.getElementById('listOutput');
 const urlFileEl = document.getElementById('urlFile');
 const importUrlsBtn = document.getElementById('importUrls');
-const concurrencyEl = document.getElementById('concurrency');
 const extractCurrentBtn = document.getElementById('extractCurrent');
 const extractBatchBtn = document.getElementById('extractBatch');
 const pauseBatchBtn = document.getElementById('pauseBatch');
@@ -11,20 +10,39 @@ const downloadJsonBtn = document.getElementById('downloadJson');
 const downloadCsvBtn = document.getElementById('downloadCsv');
 const downloadUrlsBtn = document.getElementById('downloadUrls');
 const autoPaginateEl = document.getElementById('autoPaginate');
-const categoryUrlEl = document.getElementById('categoryUrl');
 const scheduleTimeEl = document.getElementById('scheduleTime');
 const saveScheduleBtn = document.getElementById('saveSchedule');
 const runDailyNowBtn = document.getElementById('runDailyNow');
 const scheduleInfoEl = document.getElementById('scheduleInfo');
+const fixedListHintEl = document.getElementById('fixedListHint');
+const autoCategoryHintEl = document.getElementById('autoCategoryHint');
+const autoStatusEl = document.getElementById('autoStatus');
+const downloadHistoryCsvBtn = document.getElementById('downloadHistoryCsv');
+const viewCacheBtn = document.getElementById('viewCache');
+const downloadCacheBtn = document.getElementById('downloadCache');
 const runFilterBtn = document.getElementById('runFilter');
 const downloadFilterBtn = document.getElementById('downloadFilter');
 const filterOutputEl = document.getElementById('filterOutput');
 const downloadHistoryBtn = document.getElementById('downloadHistory');
+const tabButtons = Array.from(document.querySelectorAll('.tab-button'));
+const tabPanels = Array.from(document.querySelectorAll('.tab-panel'));
+const filterLast30QtyEl = document.getElementById('filterLast30Qty');
+const filterDiscountedPriceEl = document.getElementById('filterDiscountedPrice');
+const filterListedDateEl = document.getElementById('filterListedDate');
+const filterSkuDropEl = document.getElementById('filterSkuDrop');
+const filterSkuAvgDropEl = document.getElementById('filterSkuAvgDrop');
+const filterSkuAvgWindowEl = document.getElementById('filterSkuAvgWindow');
 
 let results = [];
 let listUrls = [];
 let importedUrls = [];
 const MAX_LIST_PAGES = 50;
+const FIXED_BATCH_CONCURRENCY = 1;
+const FIXED_LIST_URL = 'https://shopee.ph/Motorcycle-ATV-Parts-cat.11020952.11020975?page=0';
+const FIXED_LIST_URL_PATTERN = '*://shopee.ph/Motorcycle-ATV-Parts-cat.11020952.11020975*';
+const AUTO_CATEGORY_URL = FIXED_LIST_URL;
+const TAB_STORAGE_KEY = 'popupActiveTab';
+const TAB_READY_TIMEOUT_MS = 60000;
 let batchPaused = false;
 let batchRunning = false;
 let filterUrls = [];
@@ -33,12 +51,13 @@ const STORAGE_KEYS = {
   listUrls: 'listUrls',
   listMeta: 'listMeta',
   batchResults: 'batchResults',
-  concurrency: 'batchConcurrency',
   scheduleTime: 'scheduleTime',
-  categoryUrl: 'categoryUrl',
   dailySnapshots: 'dailySnapshots',
   lastRunAt: 'lastRunAt',
-  nextRunAt: 'nextRunAt'
+  nextRunAt: 'nextRunAt',
+  cachedCategoryUrl: 'cachedCategoryUrl',
+  cachedCategoryUrls: 'cachedCategoryUrls',
+  cachedCategoryUpdatedAt: 'cachedCategoryUpdatedAt'
 };
 
 function storageGet(keys) {
@@ -53,10 +72,84 @@ function storageSet(values) {
   });
 }
 
-function normalizeConcurrency(value) {
-  const parsed = Number.parseInt(value, 10);
-  if (Number.isNaN(parsed)) return 1;
-  return Math.min(10, Math.max(1, parsed));
+function setActiveTab(tabName) {
+  tabButtons.forEach((button) => {
+    const isActive = button.dataset.tab === tabName;
+    button.classList.toggle('is-active', isActive);
+  });
+  tabPanels.forEach((panel) => {
+    const isActive = panel.dataset.tab === tabName;
+    panel.classList.toggle('is-active', isActive);
+  });
+  if (tabName) {
+    localStorage.setItem(TAB_STORAGE_KEY, tabName);
+  }
+}
+
+function restoreActiveTab() {
+  const saved = localStorage.getItem(TAB_STORAGE_KEY);
+  const fallback = tabButtons.length ? tabButtons[0].dataset.tab : null;
+  const target = saved || fallback;
+  if (target) setActiveTab(target);
+}
+
+function tabsQuery(queryInfo) {
+  return new Promise((resolve) => {
+    chrome.tabs.query(queryInfo, (tabs) => resolve(tabs || []));
+  });
+}
+
+function tabsCreate(createProperties) {
+  return new Promise((resolve) => {
+    chrome.tabs.create(createProperties, (tab) => resolve(tab));
+  });
+}
+
+function tabsUpdate(tabId, updateProperties) {
+  return new Promise((resolve) => {
+    chrome.tabs.update(tabId, updateProperties, (tab) => resolve(tab));
+  });
+}
+
+function waitForTabComplete(tabId, urlMatch) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error('页面加载超时'));
+    }, TAB_READY_TIMEOUT_MS);
+
+    function listener(updatedId, changeInfo, tab) {
+      if (updatedId !== tabId) return;
+      if (changeInfo.status !== 'complete') return;
+      if (urlMatch && tab?.url && !tab.url.startsWith(urlMatch)) return;
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve(tab);
+    }
+
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
+
+async function ensureFixedListTab() {
+  const tabs = await tabsQuery({ url: FIXED_LIST_URL_PATTERN });
+  let tab = tabs.find((item) => item && item.id);
+
+  if (tab && tab.id) {
+    if (tab.url !== FIXED_LIST_URL) {
+      tab = await tabsUpdate(tab.id, { url: FIXED_LIST_URL, active: true });
+    } else {
+      await tabsUpdate(tab.id, { active: true });
+    }
+  } else {
+    tab = await tabsCreate({ url: FIXED_LIST_URL, active: true });
+  }
+
+  if (!tab || !tab.id) return null;
+  if (tab.status === 'complete' && tab.url && tab.url.startsWith(FIXED_LIST_URL)) {
+    return tab;
+  }
+  return waitForTabComplete(tab.id, FIXED_LIST_URL);
 }
 
 function toYmd(date) {
@@ -117,10 +210,6 @@ function persistListState(meta) {
   });
 }
 
-function persistConcurrency(value) {
-  return storageSet({ [STORAGE_KEYS.concurrency]: value });
-}
-
 function updateScheduleInfo({ lastRunAt, nextRunAt }) {
   const parts = [];
   if (lastRunAt) {
@@ -136,20 +225,109 @@ function setFilterOutput(text) {
   filterOutputEl.textContent = text;
 }
 
+function setAutoStatus(text) {
+  if (autoStatusEl) {
+    autoStatusEl.textContent = text;
+  }
+}
+
 function updateFilterDownloadButton() {
   downloadFilterBtn.disabled = filterUrls.length === 0;
+}
+
+function getRecordDateText(record) {
+  if (record?.date) return record.date;
+  const ts = record?.capturedAt || record?.extractedAt || '';
+  return ts ? ts.slice(0, 10) : null;
+}
+
+function getRecordSkuList(record) {
+  if (Array.isArray(record?.skus)) return record.skus;
+  if (Array.isArray(record?.sku)) return record.sku;
+  return [];
+}
+
+function getRecordLast30Qty(record) {
+  if (typeof record?.last30Qty === 'number') return record.last30Qty;
+  if (typeof record?.sales?.last30Qty === 'number') return record.sales.last30Qty;
+  return null;
+}
+
+function getRecordOriginalPrice(record) {
+  if (typeof record?.originalPrice === 'number') return record.originalPrice;
+  if (Array.isArray(record?.originalPrice) && record.originalPrice.length) {
+    return Math.max(...record.originalPrice.filter((value) => typeof value === 'number'));
+  }
+  if (typeof record?.price?.original === 'number') return record.price.original;
+  if (Array.isArray(record?.price?.originalRange) && record.price.originalRange.length) {
+    return Math.max(...record.price.originalRange.filter((value) => typeof value === 'number'));
+  }
+  return null;
+}
+
+function getRecordDiscountedPriceMax(record) {
+  const range = Array.isArray(record?.price?.currentPHPRange) ? record.price.currentPHPRange : null;
+  if (range && range.length) {
+    const values = range.filter((value) => typeof value === 'number');
+    return values.length ? Math.max(...values) : null;
+  }
+  if (typeof record?.price?.currentPHP === 'number') return record.price.currentPHP;
+  return null;
+}
+
+function getRecordOriginalRange(record) {
+  if (Array.isArray(record?.originalPrice) && record.originalPrice.length) {
+    return record.originalPrice.filter((value) => typeof value === 'number');
+  }
+  if (Array.isArray(record?.price?.originalRange) && record.price.originalRange.length) {
+    return record.price.originalRange.filter((value) => typeof value === 'number');
+  }
+  if (typeof record?.originalPrice === 'number') return [record.originalPrice];
+  if (typeof record?.price?.original === 'number') return [record.price.original];
+  return [];
+}
+
+function getFilterOptions() {
+  const requireLast30Qty = Boolean(filterLast30QtyEl?.checked);
+  const requireDiscountedPrice = Boolean(filterDiscountedPriceEl?.checked);
+  const requireListedDate = Boolean(filterListedDateEl?.checked);
+  const requireSkuDrop = Boolean(filterSkuDropEl?.checked);
+  const requireSkuAvgDrop = Boolean(filterSkuAvgDropEl?.checked);
+  const windowValue = Number.parseInt(filterSkuAvgWindowEl?.value || '7', 10);
+  const windowSize = Number.isNaN(windowValue) ? 7 : Math.min(60, Math.max(3, windowValue));
+  if (filterSkuAvgWindowEl) {
+    filterSkuAvgWindowEl.value = String(windowSize);
+  }
+  const anySelected = requireLast30Qty ||
+    requireDiscountedPrice ||
+    requireListedDate ||
+    requireSkuDrop ||
+    requireSkuAvgDrop;
+  return {
+    requireLast30Qty,
+    requireDiscountedPrice,
+    requireListedDate,
+    requireSkuDrop,
+    requireSkuAvgDrop,
+    skuAvgWindow: windowSize,
+    skuAvgThreshold: 10,
+    anySelected
+  };
 }
 
 function hasSkuDrop(records) {
   const skuMap = new Map();
   for (const record of records) {
-    if (!record || !record.date || !Array.isArray(record.skus)) continue;
-    for (const sku of record.skus) {
+    const dateText = getRecordDateText(record);
+    if (!record || !dateText) continue;
+    const skuList = getRecordSkuList(record);
+    if (!skuList.length) continue;
+    for (const sku of skuList) {
       const name = sku?.name || '';
       const stock = sku?.stock;
       if (!name || typeof stock !== 'number') continue;
       if (!skuMap.has(name)) skuMap.set(name, new Map());
-      skuMap.get(name).set(record.date, stock);
+      skuMap.get(name).set(dateText, stock);
     }
   }
 
@@ -186,24 +364,74 @@ function hasSkuDrop(records) {
   return false;
 }
 
-function matchesRules(records) {
+function hasSkuAverageDrop(records, windowSize, avgDropThreshold) {
+  const skuMap = new Map();
+  for (const record of records) {
+    const dateText = getRecordDateText(record);
+    const dateObj = dateText ? parseYmd(dateText) : null;
+    if (!dateObj) continue;
+    const skuList = getRecordSkuList(record);
+    if (!skuList.length) continue;
+    for (const sku of skuList) {
+      const name = sku?.name || '';
+      const stock = sku?.stock;
+      if (!name || typeof stock !== 'number') continue;
+      if (!skuMap.has(name)) skuMap.set(name, new Map());
+      skuMap.get(name).set(dateText, { date: dateObj, stock });
+    }
+  }
+
+  for (const dateMap of skuMap.values()) {
+    const entries = Array.from(dateMap.values()).sort((a, b) => a.date - b.date);
+    if (entries.length < windowSize) continue;
+    const windowEntries = entries.slice(-windowSize);
+    const first = windowEntries[0];
+    const last = windowEntries[windowEntries.length - 1];
+    const totalDays = daysBetween(first.date, last.date);
+    if (totalDays <= 0) continue;
+    const totalDrop = first.stock - last.stock;
+    if (totalDrop <= 0) continue;
+    const avgPerDay = totalDrop / totalDays;
+    if (avgPerDay >= avgDropThreshold) return true;
+  }
+
+  return false;
+}
+
+function matchesRules(records, options) {
   if (!records.length) return false;
-  const sorted = records.slice().sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+  const sorted = records
+    .slice()
+    .sort((a, b) => (getRecordDateText(a) || '').localeCompare(getRecordDateText(b) || ''));
   const latest = sorted[sorted.length - 1];
   if (!latest) return false;
 
-  const last30Qty = typeof latest.last30Qty === 'number' ? latest.last30Qty : null;
-  if (last30Qty == null || last30Qty <= 200) return false;
+  if (!options?.anySelected) return true;
 
-  const originalPrice = typeof latest.originalPrice === 'number' ? latest.originalPrice : null;
-  if (originalPrice == null || originalPrice <= 150) return false;
+  if (options?.requireLast30Qty) {
+    const last30Qty = getRecordLast30Qty(latest);
+    if (last30Qty == null || last30Qty <= 200) return false;
+  }
 
-  const listedDate = parseYmd(latest.listedDate);
-  if (!listedDate) return false;
-  const today = new Date();
-  if (daysBetween(listedDate, today) > 500) return false;
+  if (options?.requireDiscountedPrice) {
+    const discountedMax = getRecordDiscountedPriceMax(latest);
+    if (discountedMax == null || discountedMax <= 150) return false;
+  }
 
-  if (!hasSkuDrop(sorted)) return false;
+  if (options?.requireListedDate) {
+    const listedDate = parseYmd(latest.listedDate);
+    if (!listedDate) return false;
+    const today = new Date();
+    if (daysBetween(listedDate, today) > 500) return false;
+  }
+
+  if (options?.requireSkuDrop) {
+    if (!hasSkuDrop(sorted)) return false;
+  }
+
+  if (options?.requireSkuAvgDrop) {
+    if (!hasSkuAverageDrop(sorted, options.skuAvgWindow, options.skuAvgThreshold)) return false;
+  }
 
   return true;
 }
@@ -214,15 +442,19 @@ function appendResult(result) {
   persistResults();
 }
 
+function formatJsonl(data) {
+  return data.map((item) => JSON.stringify(item)).join('\n');
+}
+
 function formatCsv(data) {
   const headers = [
     'url',
     'productId',
     'sellerName',
     'category',
-    'currentPricePHP',
-    'currentPriceCNY',
-    'originalPrice',
+    'currentPricePHPRange',
+    'currentPriceCNYRange',
+    'originalPriceRange',
     'discount',
     'listedDate',
     'totalQty',
@@ -240,7 +472,10 @@ function formatCsv(data) {
   const rows = [headers.join(',')];
   for (const item of data) {
     if (!item || !item.result || !item.result.success) {
-      rows.push([item.url || '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', item?.result?.error || ''].map(csvEscape).join(','));
+      const row = new Array(headers.length).fill('');
+      row[0] = item?.url || '';
+      row[headers.length - 1] = item?.result?.error || '';
+      rows.push(row.map(csvEscape).join(','));
       continue;
     }
     const payload = item.result.data;
@@ -252,9 +487,9 @@ function formatCsv(data) {
           payload.productId || '',
           payload.sellerName || '',
           payload.category || '',
-          payload.price?.currentPHP ?? '',
-          payload.price?.currentCNY ?? '',
-          payload.price?.original ?? '',
+          payload.price?.currentPHPRange ? JSON.stringify(payload.price.currentPHPRange) : '',
+          payload.price?.currentCNYRange ? JSON.stringify(payload.price.currentCNYRange) : '',
+          payload.price?.originalRange ? JSON.stringify(payload.price.originalRange) : '',
           payload.price?.discount ?? '',
           payload.listedDate || '',
           payload.sales?.totalQty ?? '',
@@ -272,6 +507,42 @@ function formatCsv(data) {
     }
   }
 
+  return rows.join('\n');
+}
+
+function formatSnapshotCsv(records) {
+  const headers = [
+    'date',
+    'capturedAt',
+    'url',
+    'productId',
+    'listedDate',
+    'originalPriceRange',
+    'last30Qty',
+    'skus'
+  ];
+  const rows = [headers.join(',')];
+  for (const record of records) {
+    const skus = getRecordSkuList(record);
+    const capturedAt = record?.capturedAt || record?.extractedAt || '';
+    rows.push(
+      [
+        getRecordDateText(record) || '',
+        capturedAt,
+        record?.url || '',
+        record?.productId ?? '',
+        record?.listedDate ?? '',
+        (() => {
+          const range = getRecordOriginalRange(record);
+          return range.length ? JSON.stringify(range) : '';
+        })(),
+        getRecordLast30Qty(record) ?? '',
+        skus.length ? JSON.stringify(skus) : ''
+      ]
+        .map(csvEscape)
+        .join(',')
+    );
+  }
   return rows.join('\n');
 }
 
@@ -324,15 +595,12 @@ extractBatchBtn.addEventListener('click', () => {
     return;
   }
 
-  const concurrency = normalizeConcurrency(concurrencyEl.value);
-  concurrencyEl.value = String(concurrency);
-  persistConcurrency(concurrency);
   results = [];
   updateDownloadButtons();
   setOutput('批量提取中...');
   persistResults();
 
-  chrome.runtime.sendMessage({ type: 'batch-start', urls, concurrency }, (response) => {
+  chrome.runtime.sendMessage({ type: 'batch-start', urls, concurrency: FIXED_BATCH_CONCURRENCY }, (response) => {
     if (!response || !response.started) {
       setOutput(`批量启动失败: ${response?.error || '未知错误'}`);
       batchRunning = false;
@@ -379,27 +647,21 @@ importUrlsBtn.addEventListener('click', () => {
   reader.readAsText(file);
 });
 
-concurrencyEl.addEventListener('change', () => {
-  const value = normalizeConcurrency(concurrencyEl.value);
-  concurrencyEl.value = String(value);
-  persistConcurrency(value);
-});
-
 saveScheduleBtn.addEventListener('click', () => {
   const scheduleTime = scheduleTimeEl.value || '02:00';
-  const categoryUrl = (categoryUrlEl.value || '').trim();
+  const categoryUrl = AUTO_CATEGORY_URL;
   storageSet({
     [STORAGE_KEYS.scheduleTime]: scheduleTime,
-    [STORAGE_KEYS.categoryUrl]: categoryUrl
+    categoryUrl
   }).then(() => {
     chrome.runtime.sendMessage(
       { type: 'config-update', scheduleTime, categoryUrl },
       (response) => {
         if (!response || !response.ok) {
-          setOutput('自动抓取配置保存失败');
+          setAutoStatus('自动抓取配置保存失败');
           return;
         }
-        setOutput('自动抓取配置已保存');
+        setAutoStatus('自动抓取配置已保存');
         chrome.runtime.sendMessage({ type: 'config-status' }, (status) => {
           if (!status) return;
           updateScheduleInfo({ lastRunAt: status.lastRunAt, nextRunAt: status.nextRunAt });
@@ -410,15 +672,22 @@ saveScheduleBtn.addEventListener('click', () => {
 });
 
 runDailyNowBtn.addEventListener('click', () => {
-  chrome.runtime.sendMessage({ type: 'daily-run-now' }, () => {
-    setOutput('已触发自动抓取任务');
-  });
+  const scheduleTime = scheduleTimeEl.value || '02:00';
+  chrome.runtime.sendMessage(
+    { type: 'config-update', scheduleTime, categoryUrl: AUTO_CATEGORY_URL },
+    () => {
+      chrome.runtime.sendMessage({ type: 'daily-run-now' }, () => {
+        setAutoStatus('已触发自动抓取任务');
+      });
+    }
+  );
 });
 
 runFilterBtn.addEventListener('click', async () => {
   setFilterOutput('筛选中...');
   filterUrls = [];
   updateFilterDownloadButton();
+  const filterOptions = getFilterOptions();
 
   const data = await storageGet([STORAGE_KEYS.dailySnapshots]);
   const snapshots = Array.isArray(data[STORAGE_KEYS.dailySnapshots])
@@ -437,7 +706,7 @@ runFilterBtn.addEventListener('click', async () => {
   }
 
   for (const [url, records] of grouped.entries()) {
-    if (matchesRules(records)) {
+    if (matchesRules(records, filterOptions)) {
       filterUrls.push(url);
     }
   }
@@ -459,25 +728,97 @@ downloadHistoryBtn.addEventListener('click', async () => {
     ? data[STORAGE_KEYS.dailySnapshots]
     : [];
   if (!snapshots.length) {
-    setOutput('暂无历史数据可下载');
+    setAutoStatus('暂无历史数据可下载');
     return;
   }
   const lines = snapshots.map((record) => JSON.stringify(record));
   downloadFile(lines.join('\n'), `shopee_history_${Date.now()}.jsonl`, 'text/plain');
 });
 
+if (downloadHistoryCsvBtn) {
+  downloadHistoryCsvBtn.addEventListener('click', async () => {
+    const data = await storageGet([STORAGE_KEYS.dailySnapshots]);
+    const snapshots = Array.isArray(data[STORAGE_KEYS.dailySnapshots])
+      ? data[STORAGE_KEYS.dailySnapshots]
+      : [];
+    if (!snapshots.length) {
+      setAutoStatus('暂无历史数据可下载');
+      return;
+    }
+    const csv = formatSnapshotCsv(snapshots);
+    downloadFile(csv, `shopee_history_${Date.now()}.csv`, 'text/csv');
+  });
+}
+
+if (viewCacheBtn) {
+  viewCacheBtn.addEventListener('click', async () => {
+    const data = await storageGet([
+      STORAGE_KEYS.cachedCategoryUrl,
+      STORAGE_KEYS.cachedCategoryUrls,
+      STORAGE_KEYS.cachedCategoryUpdatedAt,
+      STORAGE_KEYS.listUrls
+    ]);
+    const cachedUrls = Array.isArray(data[STORAGE_KEYS.cachedCategoryUrls])
+      ? data[STORAGE_KEYS.cachedCategoryUrls]
+      : [];
+    const fallbackUrls = Array.isArray(data[STORAGE_KEYS.listUrls]) ? data[STORAGE_KEYS.listUrls] : [];
+    const urls = cachedUrls.length ? cachedUrls : fallbackUrls;
+    if (!urls.length) {
+      setAutoStatus('暂无缓存URL');
+      return;
+    }
+    const updatedAt = data[STORAGE_KEYS.cachedCategoryUpdatedAt] || '';
+    const lines = [
+      `缓存URL: ${data[STORAGE_KEYS.cachedCategoryUrl] || '未记录'}`,
+      updatedAt ? `更新时间: ${updatedAt}` : '更新时间: 未记录',
+      `数量: ${urls.length}`,
+      '',
+      ...urls
+    ];
+    setFilterOutput(lines.join('\n'));
+    setActiveTab('auto');
+  });
+}
+
+if (downloadCacheBtn) {
+  downloadCacheBtn.addEventListener('click', async () => {
+    const data = await storageGet([
+      STORAGE_KEYS.cachedCategoryUrls,
+      STORAGE_KEYS.listUrls
+    ]);
+    const cachedUrls = Array.isArray(data[STORAGE_KEYS.cachedCategoryUrls])
+      ? data[STORAGE_KEYS.cachedCategoryUrls]
+      : [];
+    const fallbackUrls = Array.isArray(data[STORAGE_KEYS.listUrls]) ? data[STORAGE_KEYS.listUrls] : [];
+    const urls = cachedUrls.length ? cachedUrls : fallbackUrls;
+    if (!urls.length) {
+      setAutoStatus('暂无缓存URL可下载');
+      return;
+    }
+    downloadFile(urls.join('\n'), `shopee_cache_${Date.now()}.txt`, 'text/plain');
+  });
+}
+
 extractListBtn.addEventListener('click', async () => {
-  setListOutput('抓取中...');
+  setListOutput('打开固定分类页...');
   listUrls = [];
   updateUrlDownloadButton();
   persistListState(null);
 
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab || !tab.id) {
-    setListOutput('未找到当前标签页');
+  let tab;
+  try {
+    tab = await ensureFixedListTab();
+  } catch (error) {
+    setListOutput(`打开固定分类页失败: ${error.message}`);
     return;
   }
 
+  if (!tab || !tab.id) {
+    setListOutput('未能打开固定分类页');
+    return;
+  }
+
+  setListOutput('页面加载完成，开始抓取...');
   chrome.tabs.sendMessage(
     tab.id,
     { type: 'collect-product-urls', paginate: autoPaginateEl.checked, maxPages: MAX_LIST_PAGES },
@@ -523,6 +864,9 @@ chrome.runtime.onMessage.addListener((message) => {
     updatePauseButton();
   }
   if (message.type === 'batch-complete') {
+    if (Array.isArray(message.results) && message.results.length) {
+      results = message.results;
+    }
     setOutput(JSON.stringify(results, null, 2));
     batchRunning = false;
     batchPaused = false;
@@ -532,7 +876,7 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 downloadJsonBtn.addEventListener('click', () => {
-  downloadFile(JSON.stringify(results, null, 2), `shopdora_${Date.now()}.json`, 'application/json');
+  downloadFile(formatJsonl(results), `shopdora_${Date.now()}.jsonl`, 'text/plain');
 });
 
 downloadCsvBtn.addEventListener('click', () => {
@@ -551,15 +895,25 @@ updateUrlDownloadButton();
 updatePauseButton();
 updateFilterDownloadButton();
 
+
+if (tabButtons.length) {
+  tabButtons.forEach((button) => {
+    button.addEventListener('click', () => {
+      const tabName = button.dataset.tab;
+      if (tabName) setActiveTab(tabName);
+    });
+  });
+  restoreActiveTab();
+}
+
+
 async function restoreState() {
   const data = await storageGet([
     STORAGE_KEYS.importedUrls,
     STORAGE_KEYS.listUrls,
     STORAGE_KEYS.listMeta,
     STORAGE_KEYS.batchResults,
-    STORAGE_KEYS.concurrency,
     STORAGE_KEYS.scheduleTime,
-    STORAGE_KEYS.categoryUrl,
     STORAGE_KEYS.lastRunAt,
     STORAGE_KEYS.nextRunAt
   ]);
@@ -567,18 +921,10 @@ async function restoreState() {
   importedUrls = Array.isArray(data[STORAGE_KEYS.importedUrls]) ? data[STORAGE_KEYS.importedUrls] : [];
   listUrls = Array.isArray(data[STORAGE_KEYS.listUrls]) ? data[STORAGE_KEYS.listUrls] : [];
   results = Array.isArray(data[STORAGE_KEYS.batchResults]) ? data[STORAGE_KEYS.batchResults] : [];
-  const savedConcurrency = data[STORAGE_KEYS.concurrency];
-  if (savedConcurrency) {
-    concurrencyEl.value = String(normalizeConcurrency(savedConcurrency));
-  }
 
   const savedSchedule = data[STORAGE_KEYS.scheduleTime];
   if (savedSchedule) {
     scheduleTimeEl.value = savedSchedule;
-  }
-  const savedCategory = data[STORAGE_KEYS.categoryUrl];
-  if (savedCategory) {
-    categoryUrlEl.value = savedCategory;
   }
   updateScheduleInfo({
     lastRunAt: data[STORAGE_KEYS.lastRunAt] || null,
@@ -613,16 +959,12 @@ async function restoreState() {
     if (!response) return;
     batchPaused = Boolean(response.paused);
     batchRunning = Boolean(response.running);
-    if (response.concurrency) {
-      concurrencyEl.value = String(normalizeConcurrency(response.concurrency));
-    }
     updatePauseButton();
   });
 
   chrome.runtime.sendMessage({ type: 'config-status' }, (status) => {
     if (!status) return;
     if (status.scheduleTime) scheduleTimeEl.value = status.scheduleTime;
-    if (status.categoryUrl) categoryUrlEl.value = status.categoryUrl;
     updateScheduleInfo({ lastRunAt: status.lastRunAt, nextRunAt: status.nextRunAt });
   });
 }
